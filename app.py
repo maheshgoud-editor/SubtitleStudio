@@ -1,7 +1,8 @@
-import os, tempfile, shutil
+import os, tempfile, shutil, json, subprocess
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
+import imageio_ffmpeg
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
 
@@ -64,7 +65,8 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         rows=[]
         for seg in segments:
             original = seg.text.strip()
-            converted = translate_text(original, output, info.language) if output in {"hindi","hinglish"} else original
+            source_lang = "hi" if language == "hi" else info.language
+            converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish"} else original
             words=[]
             if seg.words:
                 for w in seg.words:
@@ -79,3 +81,70 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
     finally:
         try: tmp_path.unlink(missing_ok=True)
         except Exception: pass
+
+
+@app.post("/api/export/mp4")
+async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
+                     template: str = Form("classic"), font_size: int = Form(26)):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
+        raise HTTPException(400, "Upload a video file for MP4 export.")
+    try:
+        rows = json.loads(captions)
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("No captions to export.")
+    except Exception as exc:
+        raise HTTPException(400, "Invalid caption data.") from exc
+    job = Path(tempfile.mkdtemp(prefix="subtitle-export-"))
+    source = job / ("source" + suffix)
+    output = job / "SubtitleStudio-captioned.mp4"
+    ass = job / "captions.ass"
+    try:
+        with source.open("wb") as dst:
+            shutil.copyfileobj(file.file, dst)
+        presets = {
+            "classic": ("&H00FFFFFF", "&H80000000", 2),
+            "bold": ("&H0000FFFF", "&H80000000", 3),
+            "outline": ("&H00FFFFFF", "&H00000000", 2),
+            "minimal": ("&H00FFFFFF", "&H00000000", 1),
+            "neon": ("&H0000FFFF", "&H00000000", 3),
+            "boxed": ("&H00FFFFFF", "&H80000000", 3),
+        }
+        primary, back, border = presets.get(template, presets["classic"])
+        size = max(16, min(int(font_size), 54))
+        def ts(value):
+            centis = max(0, round(float(value) * 100))
+            hh, centis = divmod(centis, 360000)
+            mm, centis = divmod(centis, 6000)
+            ss, centis = divmod(centis, 100)
+            return f"{hh}:{mm:02d}:{ss:02d}.{centis:02d}"
+        def esc(value):
+            return str(value).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
+        lines = [
+            "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1920", "PlayResY: 1080", "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            f"Style: Default,Arial,{size},{primary},&H000000FF,&H00000000,{back},1,0,0,0,100,100,0,0,{border},2,1,2,80,80,55,1",
+            "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+        ]
+        for row in rows:
+            text = esc(row.get("text", ""))
+            if text.strip():
+                start = max(0, float(row.get("start", 0)))
+                end = max(start + 0.1, float(row.get("end", start + 1)))
+                lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{text}")
+        ass.write_text("\n".join(lines), encoding="utf-8-sig")
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg, "-y", "-i", str(source), "-vf", "subtitles=captions.ass",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+               "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
+        proc = subprocess.run(cmd, cwd=str(job), capture_output=True, text=True, timeout=3600)
+        if proc.returncode or not output.exists():
+            raise RuntimeError((proc.stderr or "FFmpeg render failed")[-1800:])
+        return FileResponse(output, media_type="video/mp4", filename="SubtitleStudio-captioned.mp4")
+    except HTTPException:
+        shutil.rmtree(job, ignore_errors=True)
+        raise
+    except Exception as exc:
+        shutil.rmtree(job, ignore_errors=True)
+        raise HTTPException(500, f"MP4 export failed: {exc}") from exc
