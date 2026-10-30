@@ -55,12 +55,13 @@ def translate_text(text, target, source_language):
         raise RuntimeError("Hindi script conversion/translation needs an internet connection. Retry online.") from exc
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
-                     output: str = Form("original"), model_size: str = Form("small")):
+                     output: str = Form("original"), model_size: str = Form("small"),
+                     punctuation: str = Form("true")):
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in allowed: raise HTTPException(400, "Unsupported media format.")
     if output not in {"original","hindi","hinglish","english"}: output = "original"
-    if model_size not in {"base","small","medium"}: model_size = "small"
+    if model_size not in {"base","small","medium","large-v3"}: model_size = "small"
     tmp_path = TMP / (next(tempfile._get_candidate_names()) + suffix)
     try:
         with tmp_path.open("wb") as out:
@@ -68,8 +69,19 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         lang = None if language == "auto" else language
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
-        segments, info = model.transcribe(str(tmp_path), language=lang, task=task,
-                                          word_timestamps=True, vad_filter=True)
+        prompt = None
+        if language == "hi":
+            prompt = "यह साफ़ और स्वाभाविक हिंदी बातचीत है। हिंदी शब्दों को देवनागरी लिपि में लिखें।"
+        elif language == "en":
+            prompt = "Transcribe clearly with natural English punctuation."
+        beam = 8 if model_size == "large-v3" else 5
+        segments, info = model.transcribe(
+            str(tmp_path), language=lang, task=task,
+            word_timestamps=True, vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 450, "speech_pad_ms": 350},
+            beam_size=beam, best_of=beam, patience=2,
+            condition_on_previous_text=True, initial_prompt=prompt
+        )
         rows=[]
         for seg in segments:
             original = seg.text.strip()
