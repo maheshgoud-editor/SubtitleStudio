@@ -16,7 +16,7 @@ hiddenimports = [
 for package in [
     "fastapi", "starlette", "uvicorn", "anyio", "multipart",
     "faster_whisper", "ctranslate2", "av", "tokenizers",
-    "huggingface_hub", "onnxruntime", "imageio_ffmpeg",
+    "huggingface_hub", "onnxruntime", "imageio_ffmpeg", "indic_transliteration",
 ]:
     d, b, h = collect_all(package)
     datas += d
