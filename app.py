@@ -23,17 +23,22 @@ def get_model(size):
     return _models[size]
 
 def romanize_devanagari(text):
-    consonants = {'क':'k','ख':'kh','ग':'g','घ':'gh','ङ':'ng','च':'ch','छ':'chh','ज':'j','झ':'jh','ञ':'ny','ट':'t','ठ':'th','ड':'d','ढ':'dh','ण':'n','त':'t','थ':'th','द':'d','ध':'dh','न':'n','प':'p','फ':'ph','ब':'b','भ':'bh','म':'m','य':'y','र':'r','ल':'l','व':'v','श':'sh','ष':'sh','स':'s','ह':'h'}
-    vowels = {'अ':'a','आ':'aa','इ':'i','ई':'ee','उ':'u','ऊ':'oo','ऋ':'ri','ए':'e','ऐ':'ai','ओ':'o','औ':'au','ा':'aa','ि':'i','ी':'ee','ु':'u','ू':'oo','ृ':'ri','े':'e','ै':'ai','ो':'o','ौ':'au','ं':'n','ँ':'n','ः':'h','्':''}
-    out=[]
-    for ch in text:
-        if ch in consonants: out.append(consonants[ch]+'a')
-        elif ch in vowels: out.append(vowels[ch])
-        elif ch != '़': out.append(ch)
-    s=''.join(out)
-    for a,b in [('a ',' '),('a,',','),('a.','.'),('a?','?'),('a!','!')]: s=s.replace(a,b)
-    return s
-
+    """Readable Roman Hindi (Hinglish), not English translation."""
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+        result = transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
+        # Turn scholarly ITRANS nasal markers into familiar chat-style spelling.
+        result = result.replace(".N", "n").replace("M", "n")
+        result = result.replace("RRi", "ri").replace("R^i", "ri")
+        result = result.replace("A", "aa").replace("I", "ee").replace("U", "oo")
+        result = result.replace("~N", "n").replace("~n", "n")
+        result = result.replace("Ch", "chh").replace("chh", "chh")
+        return result
+    except Exception:
+        # Safe fallback if transliteration support is unavailable.
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source="hi", target="en").translate(text)
 def translate_text(text, target, source_language):
     if target == "original": return text
     # Whisper can occasionally emit Urdu/Arabic script for Hindi speech.
