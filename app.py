@@ -78,7 +78,12 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
             words=[]
             if seg.words:
                 for w in seg.words:
-                    words.append({"start":round(w.start,3),"end":round(w.end,3),"text":w.word.strip()})
+                    word_text = w.word.strip()
+                    if output == "hinglish" and source_lang == "hi":
+                        word_text = romanize_devanagari(word_text)
+                    elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
+                        word_text = translate_text(word_text, "hindi", "ur")
+                    words.append({"start":round(w.start,3),"end":round(w.end,3),"text":word_text})
             rows.append({"id":len(rows)+1,"start":round(seg.start,3),"end":round(seg.end,3),
                          "text":converted,"words":words})
         return {"language":info.language,"language_probability":round(info.language_probability,3),
@@ -183,7 +188,7 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
         ass.write_text("\n".join(lines), encoding="utf-8-sig")
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [ffmpeg, "-y", "-i", str(source), "-vf", "subtitles=captions.ass",
-               "-c:v", "libx264", "-preset", "slow", "-crf", "16",
+               "-c:v", "libx264", "-preset", "veryslow", "-crf", "12",
                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "320k",
                "-movflags", "+faststart", str(output)]
         proc = subprocess.run(cmd, cwd=str(job), capture_output=True, text=True, timeout=3600)
