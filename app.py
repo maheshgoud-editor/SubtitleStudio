@@ -93,7 +93,9 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
 
 @app.post("/api/export/mp4")
 async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
-                     template: str = Form("classic"), font_size: int = Form(26)):
+                     template: str = Form("simple"), caption_mode: str = Form("sentence"),
+                     font_size: int = Form(26), position_x: float = Form(50),
+                     position_y: float = Form(86)):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
         raise HTTPException(400, "Upload a video file for MP4 export.")
@@ -111,15 +113,31 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
         with source.open("wb") as dst:
             shutil.copyfileobj(file.file, dst)
         presets = {
-            "classic": ("&H00FFFFFF", "&H80000000", 2),
-            "bold": ("&H0000FFFF", "&H80000000", 3),
-            "outline": ("&H00FFFFFF", "&H00000000", 2),
-            "minimal": ("&H00FFFFFF", "&H00000000", 1),
-            "neon": ("&H0000FFFF", "&H00000000", 3),
-            "boxed": ("&H00FFFFFF", "&H80000000", 3),
+            "simple": ("&H00FFFFFF", "&H80000000", 1, 2, 1),
+            "word-highlight": ("&H00FFFFFF", "&H0000DFFF", 3, 3, 1),
+            "karaoke": ("&H00FFFFFF", "&H00A000FF", 3, 3, 1),
+            "bold": ("&H0000FFFF", "&H80000000", 3, 3, 1),
+            "rounded": ("&H00FFFFFF", "&HAA202020", 3, 3, 1),
+            "bar": ("&H0000FF00", "&HAA101010", 3, 3, 1),
+            "dual": ("&H00FFFFFF", "&HAA000000", 3, 3, 1),
+            "gradient": ("&H00FFB0FF", "&HAA5000A0", 3, 3, 1),
+            "outline": ("&H00FFFFFF", "&H00000000", 1, 4, 1),
+            "sentence-box": ("&H00FFFFFF", "&HAA101010", 3, 3, 1),
+            "brush": ("&H00000000", "&H00FFFFFF", 3, 2, 1),
+            "pop3d": ("&H00FFFFFF", "&HAA000000", 3, 4, 2),
+            "minimal": ("&H00FFFFFF", "&H00000000", 1, 1, 0),
+            "keyword": ("&H00FFFFFF", "&H0000DFFF", 3, 3, 1),
+            "bounce": ("&H00FFFFFF", "&HAA0077FF", 3, 3, 1),
+            "emoji": ("&H00FFFFFF", "&HAA101010", 3, 3, 1),
+            "glass": ("&H00FFFFFF", "&HAA00AADD", 3, 3, 1),
+            "typewriter": ("&H00FFFFFF", "&H00000000", 1, 1, 0),
+            "subtle": ("&H00FFFFFF", "&H88101010", 3, 2, 1),
+            "blocks": ("&H00FFFFFF", "&HAA202020", 3, 2, 1),
         }
-        primary, back, border = presets.get(template, presets["classic"])
-        size = max(16, min(int(font_size), 54))
+        primary, back, border, outline, shadow = presets.get(template, presets["simple"])
+        size = max(16, min(int(font_size), 64))
+        px = max(5, min(float(position_x), 95)) * 1920 / 100
+        py = max(5, min(float(position_y), 95)) * 1080 / 100
         def ts(value):
             centis = max(0, round(float(value) * 100))
             hh, centis = divmod(centis, 360000)
@@ -132,20 +150,42 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
             "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1920", "PlayResY: 1080", "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,Arial,{size},{primary},&H000000FF,&H00000000,{back},1,0,0,0,100,100,0,0,{border},2,1,2,80,80,55,1",
+            f"Style: Default,Arial,{size},{primary},&H000000FF,&H00000000,{back},1,0,0,0,100,100,0,0,{border},{outline},{shadow},5,80,80,55,1",
             "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         ]
         for row in rows:
-            text = esc(row.get("text", ""))
-            if text.strip():
-                start = max(0, float(row.get("start", 0)))
-                end = max(start + 0.1, float(row.get("end", start + 1)))
-                lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{text}")
+            start = max(0, float(row.get("start", 0)))
+            end = max(start + 0.1, float(row.get("end", start + 1)))
+            words = row.get("words") or []
+            if caption_mode == "word" and words:
+                for word in words:
+                    word_text = esc(word.get("text", ""))
+                    ws = max(start, float(word.get("start", start)))
+                    we = min(end, max(ws + 0.06, float(word.get("end", end))))
+                    if word_text.strip():
+                        lines.append(f"Dialogue: 0,{ts(ws)},{ts(we)},Default,,0,0,0,,{{\\an5\\pos({px:.0f},{py:.0f})}}{word_text}")
+            elif caption_mode == "karaoke" and words:
+                karaoke = []
+                for word in words:
+                    token = esc(word.get("text", ""))
+                    ws = max(start, float(word.get("start", start)))
+                    we = min(end, max(ws + 0.06, float(word.get("end", end))))
+                    duration = max(1, round((we - ws) * 100))
+                    if token.strip():
+                        karaoke.append(f"{{\\k{duration}}}{token}")
+                text = " ".join(karaoke)
+                if text.strip():
+                    lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{{\\an5\\pos({px:.0f},{py:.0f})}}{text}")
+            else:
+                text = esc(row.get("text", ""))
+                if text.strip():
+                    lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{{\\an5\\pos({px:.0f},{py:.0f})}}{text}")
         ass.write_text("\n".join(lines), encoding="utf-8-sig")
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [ffmpeg, "-y", "-i", str(source), "-vf", "subtitles=captions.ass",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-               "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
+               "-c:v", "libx264", "-preset", "slow", "-crf", "16",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "320k",
+               "-movflags", "+faststart", str(output)]
         proc = subprocess.run(cmd, cwd=str(job), capture_output=True, text=True, timeout=3600)
         if proc.returncode or not output.exists():
             raise RuntimeError((proc.stderr or "FFmpeg render failed")[-1800:])
