@@ -36,15 +36,18 @@ def romanize_devanagari(text):
 
 def translate_text(text, target, source_language):
     if target == "original": return text
-    if target == "hindi" and source_language == "hi": return text
-    if target == "hinglish" and source_language == "hi": return romanize_devanagari(text)
+    # Whisper can occasionally emit Urdu/Arabic script for Hindi speech.
+    has_urdu_script = any(0x0600 <= ord(ch) <= 0x06ff for ch in text)
+    if target == "hindi" and source_language == "hi" and not has_urdu_script:
+        return text
+    if target == "hinglish" and source_language == "hi" and not has_urdu_script:
+        return romanize_devanagari(text)
     try:
         from deep_translator import GoogleTranslator
         translated = GoogleTranslator(source="auto", target="hi").translate(text)
         return romanize_devanagari(translated) if target == "hinglish" else translated
     except Exception as exc:
-        raise RuntimeError("Online Hindi translation failed. Check internet connection and retry.") from exc
-
+        raise RuntimeError("Hindi script conversion/translation needs an internet connection. Retry online.") from exc
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small")):
