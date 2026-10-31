@@ -26,16 +26,58 @@ def get_model(size):
     return _models[size]
 
 def split_caption_rows(rows, max_words=6):
+    """Split transcript segments into short, readable caption groups."""
     result = []
     for row in rows:
-        text = str(row.get('text', '')).strip()
-        if not text: continue
-        tokens = [w for w in (row.get('words') or []) if str(w.get('text', '')).strip()]
+        text = str(row.get("text", "")).strip()
+        if not text:
+            continue
+        tokens = [
+            word for word in (row.get("words") or [])
+            if str(word.get("text", "")).strip()
+        ]
         if tokens:
             groups, current = [], []
             for token in tokens:
                 current.append(token)
-                if len(current) >= max_words or (re.search(r'[.!?।]
+                token_text = str(token.get("text", "")).strip()
+                sentence_end = bool(re.search(r"[.!?।][\"'”’)]*$", token_text))
+                if len(current) >= max_words or (sentence_end and len(current) >= 3):
+                    groups.append(current)
+                    current = []
+            if current:
+                groups.append(current)
+            for group in groups:
+                group_start = float(group[0].get("start", row.get("start", 0)))
+                group_end = float(group[-1].get("end", row.get("end", group_start + 1)))
+                group_text = " ".join(str(word.get("text", "")).strip() for word in group)
+                result.append({
+                    "id": len(result) + 1,
+                    "start": round(group_start, 3),
+                    "end": round(max(group_start + 0.08, group_end), 3),
+                    "text": group_text,
+                    "words": group,
+                })
+        else:
+            parts = text.split()
+            if not parts:
+                continue
+            start_time = float(row.get("start", 0))
+            end_time = max(start_time + 0.08, float(row.get("end", start_time + 1)))
+            duration = end_time - start_time
+            for index in range(0, len(parts), max_words):
+                chunk = parts[index:index + max_words]
+                chunk_start = start_time + duration * index / len(parts)
+                chunk_end = start_time + duration * min(index + len(chunk), len(parts)) / len(parts)
+                result.append({
+                    "id": len(result) + 1,
+                    "start": round(chunk_start, 3),
+                    "end": round(max(chunk_start + 0.08, chunk_end), 3),
+                    "text": " ".join(chunk),
+                    "words": [],
+                })
+    return result
+
     """Readable Roman Hindi (Hinglish), not English translation."""
     try:
         from indic_transliteration import sanscript
