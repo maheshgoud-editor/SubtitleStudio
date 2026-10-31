@@ -196,8 +196,22 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         segments, info = model.transcribe(
             str(tmp_path), language=lang, task=task,
             word_timestamps=word_timestamps.lower() == "true", vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 450, "speech_pad_ms": 300},
+            # Lower VAD threshold + shorter min-silence + more pre/post padding
+            # so quiet or quick words right at a pause aren't trimmed away as
+            # "silence" before Whisper ever sees them.
+            vad_parameters={
+                "threshold": 0.35,
+                "min_silence_duration_ms": 300,
+                "speech_pad_ms": 400,
+            },
             beam_size=beam, best_of=1, patience=1, temperature=0,
+            # Default thresholds are tuned for clean studio audio and will
+            # silently drop low-confidence segments (which looks like
+            # "missing words" in the captions). Relax them so marginal
+            # speech is still transcribed instead of discarded.
+            no_speech_threshold=0.75,
+            log_prob_threshold=-1.5,
+            compression_ratio_threshold=2.6,
             condition_on_previous_text=(quality_mode == "accurate"), initial_prompt=prompt
         )
         rows=[]
