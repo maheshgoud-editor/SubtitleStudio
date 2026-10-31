@@ -179,7 +179,13 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
         prompt_parts = []
-        if language == "hi":
+        if output == "english":
+            # task="translate" already asks Whisper for an English
+            # translation. Never feed a Devanagari-script instruction here -
+            # it fights the translate task and can drag the output back
+            # into Hindi script even though English was requested.
+            prompt_parts.append("Translate the speech into clear, natural English.")
+        elif language == "hi":
             prompt_parts.append("यह स्वाभाविक बोलचाल की हिंदी है। हिंदी शब्दों को देवनागरी में लिखें और अंग्रेज़ी शब्दों को अनावश्यक रूप से हिंदी में न बदलें।")
         elif language == "en":
             prompt_parts.append("Transcribe clearly with natural English punctuation.")
