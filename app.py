@@ -1,4 +1,4 @@
-import os, tempfile, shutil, json, subprocess, re
+import os, tempfile, shutil, json, subprocess, re, requests
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -60,7 +60,7 @@ def translate_text(text, target, source_language):
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
                      punctuation: str = Form("true"), quality_mode: str = Form("balanced"),
-                     vocabulary: str = Form(""), word_timestamps: str = Form("true")):
+                     vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local")):
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in allowed: raise HTTPException(400, "Unsupported media format.")
@@ -71,6 +71,46 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         with tmp_path.open("wb") as out:
             shutil.copyfileobj(file.file, out)
         lang = None if language == "auto" else language
+        if engine == "sarvam":
+            api_key = os.getenv("SARVAM_API_KEY")
+            if not api_key:
+                raise HTTPException(400, "Sarvam engine selected but SARVAM_API_KEY is missing on the server.")
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            probe = subprocess.run([ffmpeg, "-i", str(tmp_path)], capture_output=True, text=True, timeout=30)
+            match = re.search(r"Duration: (\\d+):(\\d+):(\\d+(?:\\.\\d+)?)", probe.stderr or "")
+            if not match:
+                raise HTTPException(400, "Could not read media duration.")
+            duration = int(match.group(1))*3600 + int(match.group(2))*60 + float(match.group(3))
+            lang_code = {"hi":"hi-IN","en":"en-IN","mr":"mr-IN","ur":"ur-IN"}.get(language, "unknown")
+            mode = "translate" if output == "english" else ("translit" if output == "hinglish" else ("codemix" if output == "original" else "transcribe"))
+            rows = []
+            for offset in range(0, max(1, int(duration)+1), 25):
+                wav = TMP / (next(tempfile._get_candidate_names()) + ".wav")
+                try:
+                    conv = subprocess.run([ffmpeg,"-y","-ss",str(offset),"-t","25","-i",str(tmp_path),"-vn","-ac","1","-ar","16000","-c:a","pcm_s16le",str(wav)],capture_output=True,text=True,timeout=120)
+                    if conv.returncode or not wav.exists() or wav.stat().st_size < 1000:
+                        continue
+                    with wav.open("rb") as audio:
+                        data = {"model":"saaras:v4","language_code":lang_code,"mode":mode,"with_timestamps":"true"}
+                        terms = [x.strip() for x in (vocabulary or "").split(",") if x.strip()][:50]
+                        if terms: data["keyterms"] = json.dumps(terms)
+                        resp = requests.post("https://api.sarvam.ai/speech-to-text",headers={"api-subscription-key":api_key},files={"file":(wav.name,audio,"audio/wav")},data=data,timeout=90)
+                    if not resp.ok:
+                        raise RuntimeError("Sarvam API "+str(resp.status_code)+": "+resp.text[:400])
+                    result = resp.json()
+                    stamps = result.get("timestamps") or {}
+                    phrases, starts, ends = stamps.get("words") or [], stamps.get("start_time_seconds") or [], stamps.get("end_time_seconds") or []
+                    if phrases and len(phrases)==len(starts)==len(ends):
+                        for phrase, start, end in zip(phrases,starts,ends):
+                            if str(phrase).strip():
+                                rows.append({"id":len(rows)+1,"start":round(offset+float(start),3),"end":round(offset+float(end),3),"text":str(phrase).strip(),"words":[]})
+                    elif result.get("transcript","").strip():
+                        rows.append({"id":len(rows)+1,"start":float(offset),"end":min(duration,offset+25),"text":result["transcript"].strip(),"words":[]})
+                finally:
+                    wav.unlink(missing_ok=True)
+            if not rows:
+                raise RuntimeError("Sarvam returned no transcript.")
+            return {"language":language if language!="auto" else "hi","language_probability":None,"segments":rows,"message":"Sarvam transcription complete","engine":"sarvam"}
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
         prompt_parts = []
