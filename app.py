@@ -77,7 +77,7 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                 raise HTTPException(400, "Sarvam engine selected but SARVAM_API_KEY is missing on the server.")
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             probe = subprocess.run([ffmpeg, "-i", str(tmp_path)], capture_output=True, text=True, timeout=30)
-            match = re.search(r"Duration: (\\d+):(\\d+):(\\d+(?:\\.\\d+)?)", probe.stderr or "")
+            match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr or "")
             if not match:
                 raise HTTPException(400, "Could not read media duration.")
             duration = int(match.group(1))*3600 + int(match.group(2))*60 + float(match.group(3))
