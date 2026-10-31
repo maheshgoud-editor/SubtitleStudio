@@ -92,9 +92,8 @@ def romanize_devanagari(text):
         result = result.replace("Ch", "chh").replace("chh", "chh")
         return result
     except Exception:
-        # Safe fallback if transliteration support is unavailable.
-        from deep_translator import GoogleTranslator
-        return GoogleTranslator(source="hi", target="en").translate(text)
+        # Preserve the Hindi transcript if optional transliteration is unavailable.
+        return text
 def translate_text(text, target, source_language):
     if target == "original" or not text:
         return text
@@ -114,9 +113,9 @@ def translate_text(text, target, source_language):
         dest = "en" if target == "english" else "hi"
         translated = GoogleTranslator(source="auto", target=dest).translate(text)
         return romanize_devanagari(translated) if target == "hinglish" else translated
-    except Exception as exc:
-        target_name = "English" if target == "english" else "Hindi"
-        raise RuntimeError(f"{target_name} output conversion failed. Check server internet and retry.") from exc
+    except Exception:
+        # Translation is optional: do not discard a successful speech transcript.
+        return text
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
