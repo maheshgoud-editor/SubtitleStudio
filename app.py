@@ -217,8 +217,11 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                     words.append({"start":round(w.start,3),"end":round(w.end,3),"text":word_text})
             rows.append({"id":len(rows)+1,"start":round(seg.start,3),"end":round(seg.end,3),
                          "text":converted,"words":words})
+        caption_rows = split_caption_rows(rows, 6)
+        if not caption_rows:
+            raise RuntimeError("No speech was detected. Try another audio file or select the spoken source language manually.")
         return {"language":info.language,"language_probability":round(info.language_probability,3),
-                "segments":split_caption_rows(rows, 6),"message":"Transcription complete"}
+                "segments":caption_rows,"message":"Transcription complete"}
     except HTTPException: raise
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
