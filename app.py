@@ -126,7 +126,7 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
                      template: str = Form("simple"), caption_mode: str = Form("sentence"),
                      font_size: int = Form(26), position_x: float = Form(50),
                      position_y: float = Form(86), text_color: str = Form("#ffffff"),
-                     font_name: str = Form("Arial")):
+                     font_name: str = Form("Arial"), preview_height: float = Form(0)):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
         raise HTTPException(400, "Upload a video file for MP4 export.")
@@ -173,7 +173,9 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
         dimensions = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", probe_text)
         width, height = (int(dimensions.group(1)), int(dimensions.group(2))) if dimensions else (1920, 1080)
         width, height = max(2, width), max(2, height)
-        size = max(16, min(int(font_size), 64))
+        preview_h = float(preview_height or 0)
+        scale = height / preview_h if preview_h > 40 else height / 360.0
+        size = max(16, min(round(int(font_size) * scale), 240))
         px = max(2, min(float(position_x), 98)) * width / 100
         py = max(2, min(float(position_y), 98)) * height / 100
         clean_color = text_color if re.fullmatch(r"#[0-9a-fA-F]{6}", text_color or "") else "#ffffff"
