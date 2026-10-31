@@ -78,6 +78,7 @@ def split_caption_rows(rows, max_words=6):
                 })
     return result
 
+def romanize_devanagari(text):
     """Readable Roman Hindi (Hinglish), not English translation."""
     try:
         from indic_transliteration import sanscript
