@@ -274,7 +274,31 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
             else:
                 text = esc(row.get("text", ""))
                 if text.strip():
-                    lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{{\\an5\\pos({px:.0f},{py:.0f})}}{text}")
+                    # Distinct ASS treatments for still-image export parity with the live templates.
+                    style_tags = {
+                        "simple": r"\\bord2\\shad1",
+                        "word-highlight": r"\\bord3\\3c&H00DFFF&",
+                        "karaoke": r"\\bord3\\3c&H8000FF&",
+                        "bold": r"\\b1\\fs" + str(size+4) + r"\\c&H00FFFF&\\bord3\\3c&H000000&",
+                        "rounded": r"\\bord8\\3c&H202020&\\be2",
+                        "bar": r"\\bord10\\3c&H131307&\\c&H00FFFF&",
+                        "dual": r"\\bord4\\3c&H000000&\\shad2",
+                        "gradient": r"\\bord4\\3c&H800050&\\c&HFFB0FF&",
+                        "outline": r"\\bord4\\3c&H000000&\\shad0",
+                        "sentence-box": r"\\bord8\\3c&H101010&\\be1",
+                        "brush": r"\\b1\\bord5\\3c&HFFFFFF&\\c&H000000&",
+                        "pop3d": r"\\b1\\bord3\\3c&H2222AA&\\shad4",
+                        "minimal": r"\\bord1\\3c&H000000&\\shad0",
+                        "keyword": r"\\b1\\bord3\\3c&H00DFFF&",
+                        "bounce": r"\\b1\\bord4\\3c&HFF7700&\\shad2",
+                        "emoji": r"\\b1\\bord6\\3c&H101010&",
+                        "glass": r"\\bord5\\3c&HFFDD00&\\be3",
+                        "typewriter": r"\\fnCourier New\\fsp2\\bord1\\shad0",
+                        "subtle": r"\\bord5\\3c&H2A1A12&\\shad1",
+                        "blocks": r"\\b1\\bord3\\3c&H202020&"
+                    }
+                    tag = style_tags.get(template, style_tags["simple"])
+                    lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{{\\an5\\pos({px:.0f},{py:.0f}){tag}}}{text}")
         ass.write_text("\n".join(lines), encoding="utf-8-sig")
         cmd = [ffmpeg, "-y", "-i", str(source), "-vf", "subtitles=captions.ass",
                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
