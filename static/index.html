@@ -172,21 +172,42 @@ function setFile(f){
 }
 $('drop').onclick=()=>$('file').click();$('file').onchange=e=>setFile(e.target.files[0]);$('drop').ondragover=e=>{e.preventDefault();$('drop').style.borderColor='#35d6ef'};$('drop').ondrop=e=>{e.preventDefault();setFile(e.dataTransfer.files[0])};
 $('generate').onclick=async()=>{
- if(!file)return;
- let fd=new FormData();fd.append('file',file);fd.append('language',$('language').value);
+ if(!file){$('status').textContent='Please upload an audio or video file first.';return}
+ const button=$('generate');
+ let fd=new FormData();
+ fd.append('file',file);fd.append('language',$('language').value);
  fd.append('output',$('output').value);fd.append('model_size',$('model').value);
- fd.append('punctuation',$('punct').checked?'true':'false');fd.append('engine',$('engine').value);fd.append('quality_mode',$('quality').value);fd.append('vocabulary',$('vocabulary').value);fd.append('word_timestamps',$('words').checked?'true':'false');
- $('generate').disabled=true;$('status').textContent='Transcribing… first run may include model download.';
+ fd.append('punctuation',$('punct').checked?'true':'false');fd.append('engine',$('engine').value);
+ fd.append('quality_mode',$('quality').value);fd.append('vocabulary',$('vocabulary').value);
+ fd.append('word_timestamps',$('words').checked?'true':'false');
+ button.disabled=true;button.textContent='⏳ Generating…';
+ $('status').textContent='Uploading media and starting transcription…';
+ $('segments').textContent='Transcription is running…';$('count').textContent='Processing';
  $('bar').classList.add('indeterminate');$('bar').style.width='35%';
- const started=Date.now();let ticker=setInterval(()=>$('status').textContent='Transcribing… '+Math.floor((Date.now()-started)/1000)+'s elapsed. Please keep this tab open.',1000);
+ const started=Date.now();
+ const ticker=setInterval(()=>$('status').textContent='Transcribing… '+Math.floor((Date.now()-started)/1000)+'s elapsed. Please keep this tab open.',1000);
  try{
-  let res=await fetch('/api/transcribe',{method:'POST',body:fd});
-  let data=await res.json();if(!res.ok)throw new Error(data.detail||'Transcription failed');
-  rows=data.segments||[];$('bar').style.width='100%';
-  $('status').textContent='Complete · '+data.language+' detected · '+rows.length+' subtitle segments';
+  const res=await fetch('/api/transcribe',{method:'POST',body:fd});
+  const raw=await res.text();
+  let data;
+  try{data=JSON.parse(raw)}catch(_){throw new Error('Server returned an unreadable response (HTTP '+res.status+'). '+raw.slice(0,180))}
+  if(!res.ok)throw new Error(data.detail||data.message||('Server error HTTP '+res.status));
+  if(!Array.isArray(data.segments))throw new Error('Server response did not contain a captions list. Please retry.');
+  if(data.segments.length===0)throw new Error('No speech/captions were detected. Check the audio and source language, then retry.');
+  rows=data.segments.filter(r=>r&&typeof r.text==='string'&&r.text.trim());
+  if(!rows.length)throw new Error('The transcription returned empty caption text. Please retry with another model or source language.');
+  $('bar').style.width='100%';
+  $('status').textContent='Success · '+(data.language||'language unknown')+' · '+rows.length+' captions';
   render();$('liveCaption').hidden=false;syncCaption();
- }catch(e){$('status').textContent='Error: '+e.message;$('bar').style.width='0%'}
- finally{clearInterval(ticker);$('bar').classList.remove('indeterminate');$('generate').disabled=false}
+ }catch(e){
+  rows=[];$('count').textContent='0 lines';
+  $('segments').textContent='Could not generate captions: '+(e.message||String(e));
+  $('status').textContent='Caption error: '+(e.message||String(e));
+  $('bar').style.width='0%';
+ }finally{
+  clearInterval(ticker);$('bar').classList.remove('indeterminate');
+  button.disabled=false;button.textContent='▶ Generate Captions';
+ }
 };
 function render(){let q=$('search').value.toLowerCase();$('count').textContent=rows.length+' lines';$('segments').innerHTML='';rows.forEach(r=>{if(q&&!r.text.toLowerCase().includes(q))return;let d=document.createElement('div');d.className='segment';d.innerHTML='<span class="time">'+fmt(r.start)+'</span><textarea aria-label="Edit subtitle"></textarea><button class="iconbtn" title="Jump to time">✎</button>';let ta=d.querySelector('textarea');ta.value=r.text;ta.placeholder='Edit caption text here…';ta.title='Manual edit: changes are used in the live preview and MP4 export';ta.oninput=()=>{r.text=ta.value;syncCaption()};d.querySelector('button').onclick=()=>{if(!$('video').hidden){$('video').currentTime=r.start;$('video').play()}};d.onclick=()=>{document.querySelectorAll('.segment').forEach(x=>x.classList.remove('active'));d.classList.add('active')};$('segments').appendChild(d)});syncCaption()}
 function activeSegment(t){
