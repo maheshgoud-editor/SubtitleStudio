@@ -18,8 +18,11 @@ def home():
     return FileResponse(ROOT / "static" / "index.html")
 
 def get_model(size):
+    # Cache loaded models and tune CPU inference to avoid repeated cold starts.
     if size not in _models:
-        _models[size] = WhisperModel(size, device="cpu", compute_type="int8")
+        cpu_threads = max(1, min(os.cpu_count() or 2, 8))
+        _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
+                                     cpu_threads=cpu_threads, num_workers=1)
     return _models[size]
 
 def romanize_devanagari(text):
@@ -74,13 +77,14 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
             prompt = "यह साफ़ और स्वाभाविक हिंदी बातचीत है। हिंदी शब्दों को देवनागरी लिपि में लिखें।"
         elif language == "en":
             prompt = "Transcribe clearly with natural English punctuation."
-        beam = 8 if model_size == "large-v3" else 5
+        # Fast balanced decoding; higher model sizes remain available for accuracy-first jobs.
+        beam = 1 if model_size in {"base", "small"} else (3 if model_size == "medium" else 4)
         segments, info = model.transcribe(
             str(tmp_path), language=lang, task=task,
             word_timestamps=True, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 450, "speech_pad_ms": 350},
-            beam_size=beam, best_of=beam, patience=2,
-            condition_on_previous_text=True, initial_prompt=prompt
+            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 250},
+            beam_size=beam, best_of=1, patience=1, temperature=0,
+            condition_on_previous_text=False, initial_prompt=prompt
         )
         rows=[]
         for seg in segments:
