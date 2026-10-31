@@ -159,7 +159,7 @@ function syncCaption(){
 }
 function applyTemplate(){
  let c=$('caption'),wrap=$('liveCaption');wrap.className='live-caption tpl-'+template;
- wrap.style.fontSize=$('fontsize').value+'px';wrap.style.color=$('color').value;
+ wrap.style.fontSize=$('fontsize').value+'px';wrap.style.setProperty('color',$('color').value,'important');
  wrap.style.left=pos.x+'%';wrap.style.top=pos.y+'%';wrap.style.bottom='auto';
  wrap.style.transform='translate(-50%,-50%)';wrap.style.width='min(86%,720px)';
  wrap.style.maxWidth='86%';c.style.color='inherit';requestAnimationFrame(fitCaption);
