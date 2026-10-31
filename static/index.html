@@ -55,7 +55,7 @@ video{width:100%;max-height:440px;background:#05080d;display:block;border-radius
 <div class="panel"><div class="panel-head">② Language & AI Model</div><div class="panel-body">
 <div class="field"><label>Source language</label><select id="language"><option value="auto">Auto Detect (100+ languages)</option><option value="en">English</option><option value="hi">Hindi</option><option value="mr">Marathi</option><option value="ur">Urdu</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="ja">Japanese</option><option value="zh">Chinese</option></select></div>
 <div class="field"><label>AI Model</label><select id="model"><option value="small">Whisper Small (Balanced)</option><option value="base">Whisper Base (Fast)</option><option value="medium">Whisper Medium (Higher accuracy)</option><option value="large-v3">Whisper Large-v3 (Best accuracy · slow)</option></select></div>
-<div class="field"><label>Transcription mode</label><select id="quality"><option value="fast">Fast · quickest</option><option value="balanced" selected>Balanced · recommended</option><option value="accurate">Accuracy first · slower</option></select></div>
+<div class="field"><label>Transcription engine</label><select id="engine"><option value="local">Local Whisper</option><option value="sarvam">Sarvam Saaras v4 · Hindi / Hinglish / Indian English</option></select><div class="muted">Sarvam needs SARVAM_API_KEY configured in server environment.</div></div><div class="field"><label>Transcription mode</label><select id="quality"><option value="fast">Fast · quickest</option><option value="balanced" selected>Balanced · recommended</option><option value="accurate">Accuracy first · slower</option></select></div>
 <div class="field"><label>Custom names / vocabulary (optional)</label><input id="vocabulary" type="text" maxlength="800" placeholder="e.g. Mahesh, Khalilabad, Moro Toons"></div>
 <div class="field"><label>Subtitle language / output</label><select id="output"><option value="original">Same as speech (original script)</option><option value="hindi">Hindi translation (Devanagari)</option><option value="hinglish">Hinglish (Roman Hindi)</option><option value="english">English</option></select></div>
 <label class="check"><input type="checkbox" id="punct" checked> Auto punctuation (Whisper)</label>
@@ -122,7 +122,7 @@ $('generate').onclick=async()=>{
  if(!file)return;
  let fd=new FormData();fd.append('file',file);fd.append('language',$('language').value);
  fd.append('output',$('output').value);fd.append('model_size',$('model').value);
- fd.append('punctuation',$('punct').checked?'true':'false');fd.append('quality_mode',$('quality').value);fd.append('vocabulary',$('vocabulary').value);fd.append('word_timestamps',$('words').checked?'true':'false');
+ fd.append('punctuation',$('punct').checked?'true':'false');fd.append('engine',$('engine').value);fd.append('quality_mode',$('quality').value);fd.append('vocabulary',$('vocabulary').value);fd.append('word_timestamps',$('words').checked?'true':'false');
  $('generate').disabled=true;$('status').textContent='Transcribing… first run may include model download.';
  $('bar').classList.add('indeterminate');$('bar').style.width='35%';
  const started=Date.now();let ticker=setInterval(()=>$('status').textContent='Transcribing… '+Math.floor((Date.now()-started)/1000)+'s elapsed. Please keep this tab open.',1000);
