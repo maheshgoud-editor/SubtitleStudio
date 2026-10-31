@@ -96,19 +96,27 @@ def romanize_devanagari(text):
         from deep_translator import GoogleTranslator
         return GoogleTranslator(source="hi", target="en").translate(text)
 def translate_text(text, target, source_language):
-    if target == "original": return text
-    # Whisper can occasionally emit Urdu/Arabic script for Hindi speech.
+    if target == "original" or not text:
+        return text
+    has_devanagari = any(0x0900 <= ord(ch) <= 0x097f for ch in text)
     has_urdu_script = any(0x0600 <= ord(ch) <= 0x06ff for ch in text)
+    if target == "hindi" and source_language == "hi" and has_devanagari:
+        return text
+    if target == "hinglish" and source_language == "hi" and has_devanagari:
+        return romanize_devanagari(text)
+    # Enforce requested output even if a speech engine returns source script.
+    if target == "english" and not (has_devanagari or has_urdu_script):
+        return text
     if target == "hindi" and source_language == "hi" and not has_urdu_script:
         return text
-    if target == "hinglish" and source_language == "hi" and not has_urdu_script:
-        return romanize_devanagari(text)
     try:
         from deep_translator import GoogleTranslator
-        translated = GoogleTranslator(source="auto", target="hi").translate(text)
+        dest = "en" if target == "english" else "hi"
+        translated = GoogleTranslator(source="auto", target=dest).translate(text)
         return romanize_devanagari(translated) if target == "hinglish" else translated
     except Exception as exc:
-        raise RuntimeError("Hindi script conversion/translation needs an internet connection. Retry online.") from exc
+        target_name = "English" if target == "english" else "Hindi"
+        raise RuntimeError(f"{target_name} output conversion failed. Check server internet and retry.") from exc
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
@@ -163,8 +171,12 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                     wav.unlink(missing_ok=True)
             if not rows:
                 raise RuntimeError("Sarvam returned no transcript.")
+            detected = language if language != "auto" else "hi"
+            if output in {"english", "hindi", "hinglish"}:
+                for row in rows:
+                    row["text"] = translate_text(row["text"], output, detected)
             rows = split_caption_rows(rows, 6)
-            return {"language":language if language!="auto" else "hi","language_probability":None,"segments":rows,"message":"Sarvam transcription complete","engine":"sarvam"}
+            return {"language":detected,"language_probability":None,"segments":rows,"message":"Sarvam transcription complete","engine":"sarvam"}
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
         prompt_parts = []
@@ -193,7 +205,7 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         for seg in segments:
             original = seg.text.strip()
             source_lang = "hi" if language == "hi" else info.language
-            converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish"} else original
+            converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
             words=[]
             if seg.words:
                 for w in seg.words:
