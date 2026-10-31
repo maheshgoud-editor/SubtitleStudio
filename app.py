@@ -357,23 +357,6 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
     except Exception as exc:
         shutil.rmtree(job, ignore_errors=True)
         raise HTTPException(500, f"MP4 export failed: {exc}") from exc
-, str(token.get('text',''))) and len(current) >= 3):
-                    groups.append(current); current = []
-            if current: groups.append(current)
-            for group in groups:
-                start=float(group[0].get('start',row.get('start',0))); end=float(group[-1].get('end',row.get('end',start+1)))
-                result.append({'id':len(result)+1,'start':round(start,3),'end':round(max(start+0.08,end),3),'text':' '.join(str(w.get('text','')).strip() for w in group),'words':group})
-        else:
-            parts=text.split()
-            if len(parts)<=max_words:
-                result.append({'id':len(result)+1,'start':float(row.get('start',0)),'end':float(row.get('end',row.get('start',0)+1)),'text':text,'words':[]}); continue
-            start=float(row.get('start',0)); duration=max(.1,float(row.get('end',start+1))-start)
-            groups=[parts[i:i+max_words] for i in range(0,len(parts),max_words)]
-            for i,g in enumerate(groups):
-                x=start+duration*i/len(groups); y=start+duration*(i+1)/len(groups)
-                result.append({'id':len(result)+1,'start':round(x,3),'end':round(max(x+.08,y),3),'text':' '.join(g),'words':[]})
-    return result
-
 def romanize_devanagari(text):
     """Readable Roman Hindi (Hinglish), not English translation."""
     try:
