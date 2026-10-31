@@ -1,4 +1,4 @@
-import os, tempfile, shutil, json, subprocess
+import os, tempfile, shutil, json, subprocess, re
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -59,7 +59,8 @@ def translate_text(text, target, source_language):
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
-                     punctuation: str = Form("true")):
+                     punctuation: str = Form("true"), quality_mode: str = Form("balanced"),
+                     vocabulary: str = Form(""), word_timestamps: str = Form("true")):
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in allowed: raise HTTPException(400, "Unsupported media format.")
@@ -72,19 +73,27 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         lang = None if language == "auto" else language
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
-        prompt = None
+        prompt_parts = []
         if language == "hi":
-            prompt = "यह साफ़ और स्वाभाविक हिंदी बातचीत है। हिंदी शब्दों को देवनागरी लिपि में लिखें।"
+            prompt_parts.append("यह स्वाभाविक बोलचाल की हिंदी है। हिंदी शब्दों को देवनागरी में लिखें और अंग्रेज़ी शब्दों को अनावश्यक रूप से हिंदी में न बदलें।")
         elif language == "en":
-            prompt = "Transcribe clearly with natural English punctuation."
-        # Fast balanced decoding; higher model sizes remain available for accuracy-first jobs.
-        beam = 1 if model_size in {"base", "small"} else (3 if model_size == "medium" else 4)
+            prompt_parts.append("Transcribe clearly with natural English punctuation.")
+        if punctuation.lower() != "true":
+            prompt_parts.append("Use minimal punctuation; preserve the spoken words.")
+        vocab = (vocabulary or "").strip()
+        if vocab:
+            prompt_parts.append("Names and domain vocabulary (use these spellings when heard): " + vocab[:800])
+        prompt = " ".join(prompt_parts) or None
+        quality_mode = quality_mode if quality_mode in {"fast", "balanced", "accurate"} else "balanced"
+        beam = {"fast": 1, "balanced": 3, "accurate": 5}[quality_mode]
+        if model_size == "base":
+            beam = min(beam, 2)
         segments, info = model.transcribe(
             str(tmp_path), language=lang, task=task,
-            word_timestamps=True, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 250},
+            word_timestamps=word_timestamps.lower() == "true", vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 450, "speech_pad_ms": 300},
             beam_size=beam, best_of=1, patience=1, temperature=0,
-            condition_on_previous_text=False, initial_prompt=prompt
+            condition_on_previous_text=(quality_mode == "accurate"), initial_prompt=prompt
         )
         rows=[]
         for seg in segments:
@@ -116,7 +125,8 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
 async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
                      template: str = Form("simple"), caption_mode: str = Form("sentence"),
                      font_size: int = Form(26), position_x: float = Form(50),
-                     position_y: float = Form(86)):
+                     position_y: float = Form(86), text_color: str = Form("#ffffff"),
+                     font_name: str = Form("Arial")):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
         raise HTTPException(400, "Upload a video file for MP4 export.")
@@ -156,9 +166,20 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
             "blocks": ("&H00FFFFFF", "&HAA202020", 3, 2, 1),
         }
         primary, back, border, outline, shadow = presets.get(template, presets["simple"])
+        # Probe source dimensions so ASS coordinates work for portrait, square and landscape.
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        probe = subprocess.run([ffmpeg, "-i", str(source)], capture_output=True, text=True, timeout=30)
+        probe_text = (probe.stderr or "") + (probe.stdout or "")
+        dimensions = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", probe_text)
+        width, height = (int(dimensions.group(1)), int(dimensions.group(2))) if dimensions else (1920, 1080)
+        width, height = max(2, width), max(2, height)
         size = max(16, min(int(font_size), 64))
-        px = max(5, min(float(position_x), 95)) * 1920 / 100
-        py = max(5, min(float(position_y), 95)) * 1080 / 100
+        px = max(2, min(float(position_x), 98)) * width / 100
+        py = max(2, min(float(position_y), 98)) * height / 100
+        clean_color = text_color if re.fullmatch(r"#[0-9a-fA-F]{6}", text_color or "") else "#ffffff"
+        rgb = clean_color.lstrip("#")
+        primary = f"&H00{rgb[4:6]}{rgb[2:4]}{rgb[0:2]}"
+        safe_font = re.sub(r"[^A-Za-z0-9 _-]", "", font_name or "Arial")[:40] or "Arial"
         def ts(value):
             centis = max(0, round(float(value) * 100))
             hh, centis = divmod(centis, 360000)
@@ -168,10 +189,10 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
         def esc(value):
             return str(value).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
         lines = [
-            "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1920", "PlayResY: 1080", "",
+            "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}", "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,Arial,{size},{primary},&H000000FF,&H00000000,{back},1,0,0,0,100,100,0,0,{border},{outline},{shadow},5,80,80,55,1",
+            f"Style: Default,{safe_font},{size},{primary},&H000000FF,&H00000000,{back},1,0,0,0,100,100,0,0,{border},{outline},{shadow},5,80,80,55,1",
             "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         ]
         for row in rows:
@@ -202,10 +223,9 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
                 if text.strip():
                     lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{{\\an5\\pos({px:.0f},{py:.0f})}}{text}")
         ass.write_text("\n".join(lines), encoding="utf-8-sig")
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [ffmpeg, "-y", "-i", str(source), "-vf", "subtitles=captions.ass",
-               "-c:v", "libx264", "-preset", "veryslow", "-crf", "12",
-               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "320k",
+               "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                "-movflags", "+faststart", str(output)]
         proc = subprocess.run(cmd, cwd=str(job), capture_output=True, text=True, timeout=3600)
         if proc.returncode or not output.exists():
