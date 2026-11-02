@@ -1,7 +1,10 @@
-import os, tempfile, shutil, json, subprocess, re, requests
+import os, time, tempfile, shutil, json, subprocess, re, requests
+from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 import imageio_ffmpeg
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
@@ -11,18 +14,105 @@ TMP = Path(tempfile.gettempdir()) / "subtitle-studio"
 TMP.mkdir(exist_ok=True)
 app = FastAPI(title="Subtitle Studio")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
-_models = {}
+_models = OrderedDict()
+# Cap how many Whisper models stay loaded in RAM at once. Users can pick
+# different model sizes (base/small/medium/large-v3); without a cap, every
+# distinct size ever requested stays cached forever - large-v3 alone is
+# several GB, so this grows unbounded over time. Override with MAX_CACHED_MODELS.
+MAX_CACHED_MODELS = int(os.getenv("MAX_CACHED_MODELS", "2"))
+
+# ---------------------------------------------------------------------------
+# Upload size limit. A public tool with no cap lets anyone upload huge files
+# and exhaust server disk/memory. Override with the MAX_UPLOAD_MB env var.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "500")) * 1024 * 1024
+UPLOAD_CHUNK = 1024 * 1024
+
+async def save_upload_limited(upload: UploadFile, dest: Path, max_bytes: int = MAX_UPLOAD_BYTES):
+    """Stream an upload to disk, aborting with 413 if it exceeds max_bytes.
+    Using file.file + shutil.copyfileobj (as this project used to) reads an
+    unbounded amount of data with no size check at all."""
+    total = 0
+    with dest.open("wb") as out:
+        while True:
+            chunk = await upload.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                out.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(
+                    413,
+                    f"File is too large. Maximum allowed size is {max_bytes // (1024*1024)} MB.",
+                )
+            out.write(chunk)
+    await upload.seek(0)
+    return total
+
+# ---------------------------------------------------------------------------
+# Very small in-memory per-IP rate limiter for the expensive endpoints
+# (transcription, MP4 rendering). This is intentionally simple (no Redis,
+# no external service) - good enough to stop one visitor or script from
+# hammering the server endlessly; it resets if the process restarts.
+# Override with RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_SECONDS env vars.
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "8"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "600"))
+_request_log = defaultdict(deque)
+
+def enforce_rate_limit(request: Request):
+    # Behind a reverse proxy (Hugging Face Spaces, Docker behind nginx,
+    # etc.) request.client.host is the proxy's own address, not the
+    # visitor's - which would turn this into one shared limit for every
+    # visitor combined. Prefer the forwarded header when present.
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    log = _request_log[client_ip]
+    while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
+        log.popleft()
+    if len(log) >= RATE_LIMIT_MAX:
+        raise HTTPException(
+            429,
+            f"Too many requests. Limit is {RATE_LIMIT_MAX} per "
+            f"{RATE_LIMIT_WINDOW_SECONDS // 60} minutes - please wait and try again.",
+        )
+    log.append(now)
 
 @app.get("/")
 def home():
     return FileResponse(ROOT / "static" / "index.html")
 
 def get_model(size):
-    # Cache loaded models and tune CPU inference to avoid repeated cold starts.
-    if size not in _models:
-        cpu_threads = max(1, min(os.cpu_count() or 2, 8))
-        _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
-                                     cpu_threads=cpu_threads, num_workers=1)
+    # Cache loaded models (LRU, capped at MAX_CACHED_MODELS) to avoid
+    # repeated cold starts while still bounding RAM usage.
+    if size in _models:
+        _models.move_to_end(size)
+        return _models[size]
+
+    while len(_models) >= MAX_CACHED_MODELS:
+        _models.popitem(last=False)
+
+    cpu_threads = max(1, min(os.cpu_count() or 2, 8))
+    # Prefer GPU when available - "auto" (default) tries CUDA first and
+    # silently falls back to CPU if no GPU/CUDA runtime is present. The
+    # previous version hardcoded device="cpu", so a GPU-enabled host would
+    # never actually be used and transcription stayed slow regardless of
+    # what hardware the server had. Force it with WHISPER_DEVICE=cpu/cuda.
+    device_pref = os.getenv("WHISPER_DEVICE", "auto")
+    if device_pref in ("auto", "cuda"):
+        try:
+            model = WhisperModel(size, device="cuda", compute_type="float16")
+            _models[size] = model
+            return model
+        except Exception:
+            if device_pref == "cuda":
+                raise
+
+    _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
+                                 cpu_threads=cpu_threads, num_workers=1)
     return _models[size]
 
 def split_caption_rows(rows, max_words=6):
@@ -117,10 +207,11 @@ def translate_text(text, target, source_language):
         # Translation is optional: do not discard a successful speech transcript.
         return text
 @app.post("/api/transcribe")
-async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
+async def transcribe(request: Request, file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
                      punctuation: str = Form("true"), quality_mode: str = Form("balanced"),
                      vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local")):
+    enforce_rate_limit(request)
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in allowed: raise HTTPException(400, "Unsupported media format.")
@@ -128,8 +219,7 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
     if model_size not in {"base","small","medium","large-v3"}: model_size = "small"
     tmp_path = TMP / (next(tempfile._get_candidate_names()) + suffix)
     try:
-        with tmp_path.open("wb") as out:
-            shutil.copyfileobj(file.file, out)
+        await save_upload_limited(file, tmp_path)
         lang = None if language == "auto" else language
         if engine == "sarvam":
             api_key = os.getenv("SARVAM_API_KEY")
@@ -199,43 +289,55 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
         beam = {"fast": 1, "balanced": 3, "accurate": 5}[quality_mode]
         if model_size == "base":
             beam = min(beam, 2)
-        segments, info = model.transcribe(
-            str(tmp_path), language=lang, task=task,
-            word_timestamps=word_timestamps.lower() == "true", vad_filter=True,
-            # Lower VAD threshold + shorter min-silence + more pre/post padding
-            # so quiet or quick words right at a pause aren't trimmed away as
-            # "silence" before Whisper ever sees them.
-            vad_parameters={
-                "threshold": 0.35,
-                "min_silence_duration_ms": 300,
-                "speech_pad_ms": 400,
-            },
-            beam_size=beam, best_of=1, patience=1, temperature=0,
-            # Default thresholds are tuned for clean studio audio and will
-            # silently drop low-confidence segments (which looks like
-            # "missing words" in the captions). Relax them so marginal
-            # speech is still transcribed instead of discarded.
-            no_speech_threshold=0.75,
-            log_prob_threshold=-1.5,
-            compression_ratio_threshold=2.6,
-            condition_on_previous_text=(quality_mode == "accurate"), initial_prompt=prompt
-        )
-        rows=[]
-        for seg in segments:
-            original = seg.text.strip()
-            source_lang = "hi" if language == "hi" else info.language
-            converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
-            words=[]
-            if seg.words:
-                for w in seg.words:
-                    word_text = w.word.strip()
-                    if output == "hinglish" and source_lang == "hi":
-                        word_text = romanize_devanagari(word_text)
-                    elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
-                        word_text = translate_text(word_text, "hindi", "ur")
-                    words.append({"start":round(w.start,3),"end":round(w.end,3),"text":word_text})
-            rows.append({"id":len(rows)+1,"start":round(seg.start,3),"end":round(seg.end,3),
-                         "text":converted,"words":words})
+        def run_local_transcription():
+            # faster-whisper's transcribe() + segment iteration is pure CPU
+            # work and takes real time (seconds to minutes). Running it
+            # directly inside this async endpoint would block the single
+            # asyncio event loop, freezing the whole server - including
+            # every other visitor's page loads and requests - for as long
+            # as this one transcription runs. Doing it in a worker thread
+            # (via run_in_threadpool below) keeps the server responsive for
+            # everyone else while this request is processed.
+            segments, info = model.transcribe(
+                str(tmp_path), language=lang, task=task,
+                word_timestamps=word_timestamps.lower() == "true", vad_filter=True,
+                # Lower VAD threshold + shorter min-silence + more pre/post padding
+                # so quiet or quick words right at a pause aren't trimmed away as
+                # "silence" before Whisper ever sees them.
+                vad_parameters={
+                    "threshold": 0.35,
+                    "min_silence_duration_ms": 300,
+                    "speech_pad_ms": 400,
+                },
+                beam_size=beam, best_of=1, patience=1, temperature=0,
+                # Default thresholds are tuned for clean studio audio and will
+                # silently drop low-confidence segments (which looks like
+                # "missing words" in the captions). Relax them so marginal
+                # speech is still transcribed instead of discarded.
+                no_speech_threshold=0.75,
+                log_prob_threshold=-1.5,
+                compression_ratio_threshold=2.6,
+                condition_on_previous_text=(quality_mode == "accurate"), initial_prompt=prompt
+            )
+            local_rows = []
+            for seg in segments:
+                original = seg.text.strip()
+                source_lang = "hi" if language == "hi" else info.language
+                converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
+                words = []
+                if seg.words:
+                    for w in seg.words:
+                        word_text = w.word.strip()
+                        if output == "hinglish" and source_lang == "hi":
+                            word_text = romanize_devanagari(word_text)
+                        elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
+                            word_text = translate_text(word_text, "hindi", "ur")
+                        words.append({"start":round(w.start,3),"end":round(w.end,3),"text":word_text})
+                local_rows.append({"id":len(local_rows)+1,"start":round(seg.start,3),"end":round(seg.end,3),
+                             "text":converted,"words":words})
+            return local_rows, info
+
+        rows, info = await run_in_threadpool(run_local_transcription)
         caption_rows = split_caption_rows(rows, 6)
         if not caption_rows:
             raise RuntimeError("No speech was detected. Try another audio file or select the spoken source language manually.")
@@ -250,11 +352,12 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"),
 
 
 @app.post("/api/export/mp4")
-async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
+async def export_mp4(request: Request, file: UploadFile = File(...), captions: str = Form(...),
                      template: str = Form("simple"), caption_mode: str = Form("sentence"),
                      font_size: int = Form(26), position_x: float = Form(50),
                      position_y: float = Form(86), text_color: str = Form("#ffffff"),
                      font_name: str = Form("Arial"), preview_height: float = Form(0)):
+    enforce_rate_limit(request)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}:
         raise HTTPException(400, "Upload a video file for MP4 export.")
@@ -269,8 +372,7 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
     output = job / "SubtitleStudio-captioned.mp4"
     ass = job / "captions.ass"
     try:
-        with source.open("wb") as dst:
-            shutil.copyfileobj(file.file, dst)
+        await save_upload_limited(file, source)
         presets = {
             "simple": ("&H00FFFFFF", "&H80000000", 1, 2, 1),
             "word-highlight": ("&H00FFFFFF", "&H0000DFFF", 3, 3, 1),
@@ -381,10 +483,22 @@ async def export_mp4(file: UploadFile = File(...), captions: str = Form(...),
                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                "-movflags", "+faststart", str(output)]
-        proc = subprocess.run(cmd, cwd=str(job), capture_output=True, text=True, timeout=3600)
+        # Video encoding can take minutes for longer clips. Run it in a
+        # worker thread so it doesn't block the server's event loop (and
+        # every other visitor) for the whole duration of the encode.
+        proc = await run_in_threadpool(
+            subprocess.run, cmd, cwd=str(job), capture_output=True, text=True, timeout=3600
+        )
         if proc.returncode or not output.exists():
             raise RuntimeError((proc.stderr or "FFmpeg render failed")[-1800:])
-        return FileResponse(output, media_type="video/mp4", filename="SubtitleStudio-captioned.mp4")
+        # Delete the whole job folder (source copy + rendered mp4 + ass file)
+        # only AFTER the response has finished streaming to the client -
+        # otherwise every successful export permanently leaks a full video
+        # copy on disk and the server eventually runs out of space.
+        return FileResponse(
+            output, media_type="video/mp4", filename="SubtitleStudio-captioned.mp4",
+            background=BackgroundTask(shutil.rmtree, job, ignore_errors=True),
+        )
     except HTTPException:
         shutil.rmtree(job, ignore_errors=True)
         raise
