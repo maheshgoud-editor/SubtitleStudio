@@ -28,7 +28,7 @@ This repository includes a Dockerfile and Hugging Face Spaces Docker metadata. T
 - `MAX_UPLOAD_MB` (default `500`) - maximum upload size in MB for both transcription and MP4 export.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_SECONDS` (default `8` requests / `600` seconds) - simple per-IP rate limit on the transcription and export endpoints. This is in-memory only and resets on restart; for serious production traffic, put a real rate limiter/WAF in front instead.
 - `MAX_CACHED_MODELS` (default `2`) - how many Whisper model sizes stay loaded in RAM at once (LRU eviction beyond this).
-- `WHISPER_DEVICE` (default `auto`) - `auto` tries GPU (CUDA) first and falls back to CPU automatically; set to `cpu` or `cuda` to force one.
+- `WHISPER_DEVICE` (default `cpu`) - CPU works everywhere with no setup. Set to `cuda` only on a host you've confirmed has a working CUDA + cuBLAS install (GPU is not auto-detected, since a broken/missing CUDA runtime fails lazily on the first transcription instead of at startup).
 - `SARVAM_API_KEY` - only needed if you select the optional, paid Sarvam engine from the UI. Not required for the default local Whisper engine.
 
 ## Local Windows run
