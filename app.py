@@ -96,20 +96,20 @@ def get_model(size):
         _models.popitem(last=False)
 
     cpu_threads = max(1, min(os.cpu_count() or 2, 8))
-    # Prefer GPU when available - "auto" (default) tries CUDA first and
-    # silently falls back to CPU if no GPU/CUDA runtime is present. The
-    # previous version hardcoded device="cpu", so a GPU-enabled host would
-    # never actually be used and transcription stayed slow regardless of
-    # what hardware the server had. Force it with WHISPER_DEVICE=cpu/cuda.
-    device_pref = os.getenv("WHISPER_DEVICE", "auto")
-    if device_pref in ("auto", "cuda"):
-        try:
-            model = WhisperModel(size, device="cuda", compute_type="float16")
-            _models[size] = model
-            return model
-        except Exception:
-            if device_pref == "cuda":
-                raise
+    # GPU support is opt-in only (WHISPER_DEVICE=cuda), not auto-detected.
+    # ctranslate2/faster-whisper can construct a CUDA-targeted model
+    # successfully even when the machine's CUDA/cuBLAS runtime is missing or
+    # broken (e.g. cublas64_12.dll not found on a normal Windows PC without
+    # the CUDA toolkit) - the failure only happens later, lazily, the first
+    # time transcribe() actually runs, which is too late for a try/except
+    # here to catch and fall back cleanly. CPU is the only choice that is
+    # guaranteed to work everywhere, so it stays the default; set
+    # WHISPER_DEVICE=cuda explicitly on a host you've confirmed has a
+    # working CUDA + cuBLAS install.
+    device_pref = os.getenv("WHISPER_DEVICE", "cpu")
+    if device_pref == "cuda":
+        _models[size] = WhisperModel(size, device="cuda", compute_type="float16")
+        return _models[size]
 
     _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
                                  cpu_threads=cpu_threads, num_workers=1)
