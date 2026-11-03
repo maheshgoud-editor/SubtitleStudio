@@ -1,4 +1,4 @@
-import os, time, tempfile, shutil, json, subprocess, re, requests, difflib, threading
+import os, time, tempfile, shutil, json, subprocess, re, requests, difflib, threading, logging
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
@@ -510,9 +510,13 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             raise RuntimeError("No speech was detected. Try another audio file or select the spoken source language manually.")
         return {"language":info.language,"language_probability":round(info.language_probability,3),
                 "segments":caption_rows,"message":"Transcription complete"}
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, f"Transcription failed: {str(e)}")
+        # Keep the full traceback in the launcher console so packaged Windows
+        # builds expose the real cause instead of only returning a generic 500.
+        logging.exception("SubtitleStudio transcription failed")
+        raise HTTPException(500, f"Transcription failed: {type(e).__name__}: {str(e)}")
     finally:
         try: tmp_path.unlink(missing_ok=True)
         except Exception: pass
