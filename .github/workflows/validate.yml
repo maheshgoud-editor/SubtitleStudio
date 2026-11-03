@@ -1,7 +1,7 @@
 name: Validate Subtitle Studio
 on:
   push:
-    branches: [main]
+    branches: [main, feature/accuracy-transcription]
   pull_request:
     branches: [main]
 jobs:
