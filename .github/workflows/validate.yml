@@ -14,6 +14,19 @@ jobs:
           python-version: "3.11"
       - run: python -m py_compile app.py
       - run: python -m unittest discover -s tests -v
+      - name: Check browser JavaScript syntax
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          html = Path("static/index.html").read_text(encoding="utf-8")
+          scripts = re.findall(r"<script>(.*?)</script>", html, flags=re.S)
+          if not scripts:
+              raise SystemExit("No inline application script found")
+          Path("frontend-check.js").write_text("\n".join(scripts), encoding="utf-8")
+          PY
+          node --check frontend-check.js
       - run: test -s static/index.html && test -s requirements.txt
   docker-build:
     runs-on: ubuntu-latest
