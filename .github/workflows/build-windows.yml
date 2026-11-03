@@ -2,7 +2,7 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, feature/accuracy-transcription]
     paths:
       - "app.py"
       - "launcher.py"
