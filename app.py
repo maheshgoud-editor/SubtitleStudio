@@ -209,7 +209,7 @@ def ai_proofread_rows(rows, output_language):
             "Preserve the exact meaning, word order, names, numbers, slang and code-switching. "
             "Do not translate, summarize, rewrite, add explanations, or invent words. "
             "If unsure, return the original line unchanged. Return ONLY valid JSON as "
-            "{\\"segments\\":[...]} with exactly the same number of strings as the input."
+            '{"segments":[...]} with exactly the same number of strings as the input.'
         )
         user_prompt = "Output language: " + str(output_language) + "\nTranscript lines (JSON): " + payload
         response = model.create_chat_completion(
