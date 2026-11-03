@@ -235,31 +235,40 @@ def ai_proofread_rows(rows, output_language):
             cleaned.append(updated)
     return cleaned
 
-def _rebalance_short_caption_tail(groups, min_words=3):
-    """Avoid tiny final captions by borrowing from earlier groups without crossing sentence ends."""
+def _rebalance_short_caption_tail(groups, max_words, min_words=3):
+    """Balance a short final caption across a contiguous suffix without reordering words."""
     if len(groups) < 2 or len(groups[-1]) >= min_words:
         return groups
-    needed = min_words - len(groups[-1])
+
+    # Find the suffix after the most recent sentence-ending boundary.
+    start = len(groups) - 1
     for index in range(len(groups) - 2, -1, -1):
-        previous = groups[index]
-        if len(previous) <= min_words:
-            continue
-        previous_last = previous[-1]
+        previous_last = groups[index][-1]
         previous_last_text = (
             str(previous_last.get("text", "")) if isinstance(previous_last, dict)
             else str(previous_last)
         ).strip()
         trailing = previous_last_text.rstrip(chr(34) + "”’)]")
-        # Do not move words across an actual sentence-ending punctuation boundary.
         if trailing.endswith((".", "!", "?", "।")):
             break
-        move = min(needed, len(previous) - min_words)
-        if move:
-            groups[-1] = previous[-move:] + groups[-1]
-            groups[index] = previous[:-move]
-            needed -= move
-        if needed <= 0:
-            break
+        start = index
+
+    suffix = groups[start:]
+    if len(suffix) < 2:
+        return groups
+    items = [item for group in suffix for item in group]
+    group_count = len(suffix)
+    if len(items) < group_count * min_words or len(items) > group_count * max_words:
+        return groups
+
+    base, remainder = divmod(len(items), group_count)
+    rebuilt = []
+    cursor = 0
+    for index in range(group_count):
+        size = base + (1 if index < remainder else 0)
+        rebuilt.append(items[cursor:cursor + size])
+        cursor += size
+    groups[start:] = rebuilt
     return groups
 
 
@@ -298,7 +307,7 @@ def split_caption_rows(rows, max_words=5):
                     current = []
             if current:
                 groups.append(current)
-            groups = _rebalance_short_caption_tail(groups)
+            groups = _rebalance_short_caption_tail(groups, max_words)
             for group in groups:
                 group_start = float(group[0].get("start", row.get("start", 0)))
                 group_end = float(group[-1].get("end", row.get("end", group_start + 1)))
