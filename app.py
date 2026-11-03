@@ -290,52 +290,94 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
         if model_size == "base":
             beam = min(beam, 2)
         def run_local_transcription():
-            # faster-whisper's transcribe() + segment iteration is pure CPU
-            # work and takes real time (seconds to minutes). Running it
-            # directly inside this async endpoint would block the single
-            # asyncio event loop, freezing the whole server - including
-            # every other visitor's page loads and requests - for as long
-            # as this one transcription runs. Doing it in a worker thread
-            # (via run_in_threadpool below) keeps the server responsive for
-            # everyone else while this request is processed.
-            segments, info = model.transcribe(
-                str(tmp_path), language=lang, task=task,
-                word_timestamps=word_timestamps.lower() == "true", vad_filter=True,
-                # Lower VAD threshold + shorter min-silence + more pre/post padding
-                # so quiet or quick words right at a pause aren't trimmed away as
-                # "silence" before Whisper ever sees them.
-                vad_parameters={
-                    "threshold": 0.35,
-                    "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 400,
-                },
-                beam_size=beam, best_of=1, patience=1, temperature=0,
-                # Default thresholds are tuned for clean studio audio and will
-                # silently drop low-confidence segments (which looks like
-                # "missing words" in the captions). Relax them so marginal
-                # speech is still transcribed instead of discarded.
-                no_speech_threshold=0.75,
-                log_prob_threshold=-1.5,
-                compression_ratio_threshold=2.6,
-                condition_on_previous_text=(quality_mode == "accurate"), initial_prompt=prompt
-            )
-            local_rows = []
-            for seg in segments:
-                original = seg.text.strip()
-                source_lang = "hi" if language == "hi" else info.language
-                converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
-                words = []
-                if seg.words:
-                    for w in seg.words:
-                        word_text = w.word.strip()
-                        if output == "hinglish" and source_lang == "hi":
-                            word_text = romanize_devanagari(word_text)
-                        elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
-                            word_text = translate_text(word_text, "hindi", "ur")
-                        words.append({"start":round(w.start,3),"end":round(w.end,3),"text":word_text})
-                local_rows.append({"id":len(local_rows)+1,"start":round(seg.start,3),"end":round(seg.end,3),
-                             "text":converted,"words":words})
-            return local_rows, info
+            # Inference runs in a worker thread so CPU-heavy decoding never
+            # blocks the FastAPI event loop.
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+            def decode(audio_path, offset=0.0, chunk_mode=False):
+                options = {
+                    "language": lang, "task": task,
+                    "word_timestamps": word_timestamps.lower() == "true",
+                    "vad_filter": not chunk_mode,
+                    "beam_size": 5 if chunk_mode else beam,
+                    "best_of": 3 if chunk_mode else 1,
+                    "patience": 1,
+                    "temperature": [0, 0.2] if chunk_mode else 0,
+                    "no_speech_threshold": 0.8 if chunk_mode else 0.75,
+                    "log_prob_threshold": -1.5,
+                    "compression_ratio_threshold": 2.6,
+                    "condition_on_previous_text": False if chunk_mode else (quality_mode == "accurate"),
+                    "initial_prompt": prompt,
+                }
+                if not chunk_mode:
+                    options["vad_parameters"] = {
+                        "threshold": 0.35, "min_silence_duration_ms": 300,
+                        "speech_pad_ms": 500,
+                    }
+                segments, info = model.transcribe(str(audio_path), **options)
+                found = []
+                for seg in segments:
+                    original = seg.text.strip()
+                    if not original:
+                        continue
+                    source_lang = "hi" if language == "hi" else info.language
+                    converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
+                    words = []
+                    if seg.words:
+                        for w in seg.words:
+                            word_text = w.word.strip()
+                            if output == "hinglish" and source_lang == "hi":
+                                word_text = romanize_devanagari(word_text)
+                            elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
+                                word_text = translate_text(word_text, "hindi", "ur")
+                            words.append({"start":round(offset+w.start,3),"end":round(offset+w.end,3),"text":word_text})
+                    found.append({"id":len(found)+1,"start":round(offset+seg.start,3),
+                                  "end":round(offset+seg.end,3),"text":converted,"words":words})
+                return found, info
+
+            # Pass 1: full-file Whisper transcription.
+            first_pass, info = decode(tmp_path)
+            if quality_mode != "accurate":
+                return first_pass, info
+
+            # Pass 2: re-decode overlapping 30-second chunks with a stronger
+            # beam and no VAD. This can recover quiet/fast words dropped by
+            # full-file VAD and reduces long-context omissions.
+            probe = subprocess.run([ffmpeg, "-i", str(tmp_path)], capture_output=True,
+                                   text=True, timeout=30)
+            match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr or "")
+            if not match:
+                return first_pass, info
+            duration = int(match.group(1))*3600 + int(match.group(2))*60 + float(match.group(3))
+            chunk_rows, offset = [], 0.0
+            chunk_size, overlap = 30.0, 2.0
+            while offset < duration:
+                length = min(chunk_size, duration-offset)
+                wav_path = TMP / (next(tempfile._get_candidate_names()) + ".wav")
+                try:
+                    proc = subprocess.run(
+                        [ffmpeg, "-y", "-ss", str(offset), "-i", str(tmp_path), "-t", str(length),
+                         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path)],
+                        capture_output=True, text=True, timeout=180)
+                    if proc.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 1000:
+                        part, _ = decode(wav_path, offset, chunk_mode=True)
+                        core_start = offset if offset == 0 else offset + overlap
+                        core_end = offset + length if offset + length >= duration else offset + length - overlap
+                        for row in part:
+                            midpoint = (row["start"] + row["end"]) / 2
+                            if core_start <= midpoint < core_end or (offset+length >= duration and midpoint <= core_end):
+                                chunk_rows.append(row)
+                finally:
+                    wav_path.unlink(missing_ok=True)
+                offset += chunk_size-overlap
+
+            # Never append both transcripts (which duplicates speech). Prefer
+            # the chunk pass only when it is non-empty and contains at least as
+            # many recognized words; otherwise preserve the full-file result.
+            count_words = lambda items: sum(len(re.findall(r"\S+", row["text"])) for row in items)
+            if chunk_rows and count_words(chunk_rows) >= count_words(first_pass):
+                return chunk_rows, info
+            return first_pass, info
 
         rows, info = await run_in_threadpool(run_local_transcription)
         caption_rows = split_caption_rows(rows, 6)
