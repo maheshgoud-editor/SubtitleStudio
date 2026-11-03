@@ -407,7 +407,18 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             # into Hindi script even though English was requested.
             prompt_parts.append("Translate the speech into clear, natural English.")
         elif language == "hi":
-            prompt_parts.append("यह स्वाभाविक बोलचाल की हिंदी है। हिंदी शब्दों को देवनागरी में लिखें और अंग्रेज़ी शब्दों को अनावश्यक रूप से हिंदी में न बदलें।")
+            prompt_parts.append(
+                "यह स्वाभाविक बोलचाल की हिंदी, Hinglish या क्षेत्रीय लहजे वाली बातचीत हो सकती है। "
+                "जो शब्द वास्तव में बोले गए हैं वही लिखें; हिंदी को देवनागरी में रखें, "
+                "स्पष्ट अंग्रेज़ी शब्दों को Latin script में रखें, और Bhojpuri/स्थानीय शब्दों को "
+                "बिना वजह शुद्ध हिंदी में न बदलें। नाम और अर्थ का अनुमान न लगाएँ।"
+            )
+        elif language == "auto":
+            prompt_parts.append(
+                "Detect the spoken language from the audio. If the speech is Hindi or Hinglish, "
+                "write Hindi words in Devanagari, preserve clearly spoken English words in Latin script, "
+                "and keep regional/colloquial wording as spoken. Do not translate or invent words."
+            )
         elif language == "en":
             prompt_parts.append("Transcribe clearly with natural English punctuation.")
         if punctuation.lower() != "true":
