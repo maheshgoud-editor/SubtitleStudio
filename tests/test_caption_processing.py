@@ -41,6 +41,10 @@ class CaptionGroupingTests(unittest.TestCase):
         ], max_words=4)
         self.assertTrue(all(len(row["text"].split()) <= 4 for row in rows))
         self.assertEqual([len(row["text"].split()) for row in rows], [3, 3, 3])
+        self.assertEqual(
+            " ".join(row["text"] for row in rows),
+            "one two three four five six seven eight nine",
+        )
 
     def test_does_not_rebalance_across_sentence_punctuation(self):
         rows = split_caption_rows([
