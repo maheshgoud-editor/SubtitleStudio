@@ -503,13 +503,27 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             return first_pass, info
 
         rows, info = await run_in_threadpool(run_local_transcription)
+        warnings = []
         if ai_correction.lower() == "true":
-            rows = await run_in_threadpool(ai_proofread_rows, rows, output if output != "original" else (language if language != "auto" else info.language))
+            try:
+                rows = await run_in_threadpool(
+                    ai_proofread_rows, rows,
+                    output if output != "original" else (language if language != "auto" else info.language)
+                )
+            except Exception as proofread_error:
+                # Proofreading is optional: a missing native DLL, failed first-time
+                # model download, or Qwen load error must never discard a valid
+                # Whisper transcript or turn caption generation into HTTP 500.
+                logging.exception("Optional Qwen proofreading failed; keeping original Whisper transcript")
+                warnings.append(
+                    "AI proofreading was skipped; original Whisper captions are kept. "
+                    f"Reason: {type(proofread_error).__name__}: {proofread_error}"
+                )
         caption_rows = split_caption_rows(rows, 6)
         if not caption_rows:
-            raise RuntimeError("No speech was detected. Try another audio file or select the spoken source language manually.")
+            raise HTTPException(422, "No speech was detected. Try another audio file or select the spoken source language manually.")
         return {"language":info.language,"language_probability":round(info.language_probability,3),
-                "segments":caption_rows,"message":"Transcription complete"}
+                "segments":caption_rows,"warnings":warnings,"message":"Transcription complete"}
     except HTTPException:
         raise
     except Exception as e:
