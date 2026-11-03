@@ -15,6 +15,7 @@ A responsive video/audio transcription workspace powered by faster-whisper.
 ## Features
 - Upload MP4, MOV, MKV, AVI, MP3, WAV, M4A, FLAC, AAC, OGG and WebM
 - Automatic language detection or manual selection
+- Accuracy-first mode: full-file Whisper pass followed by overlapping chunk re-transcription with stronger decoding to reduce missed words\n- Optional local Qwen proofreading after Whisper: conservative Hindi/Hinglish/English spelling and punctuation cleanup, with no paid API; downloads a ~639 MB GGUF model on first use
 - Original speech transcription, English translation, Hindi translation and Hinglish transliteration
 - Video preview with timed captions, 20 caption styles with a live preview
 - Editable transcript, search and caption styling
@@ -45,6 +46,7 @@ This repository includes a Dockerfile and Hugging Face Spaces Docker metadata. T
 ## Limitations
 - Hindi/English translation falls back to an online Google Translate service when Whisper's own output needs cleanup; this needs internet access on the server.
 - Hinglish is basic transliteration and may need proofreading.
+- Accuracy mode performs an additional overlapping Whisper pass; it can recover some missed words but cannot guarantee perfect transcription.\n- Qwen3 proofreading is a small text model and cannot listen to audio; it only suggests conservative corrections and may still be wrong. It is optional, CPU-based and can be slow. It preserves the original line when the output appears too different.
 - Speaker diarization, batch processing and waveform editing are not implemented.
 - The optional Sarvam engine (Saaras v4) is paid (free credits on signup, then pay-as-you-go) and requires your own `SARVAM_API_KEY`; the default local Whisper engine is free and does not need it.
 - The per-IP rate limit is in-memory only (resets on restart) and is meant to stop casual abuse, not to replace proper infrastructure for a production/public launch.

@@ -89,14 +89,17 @@ video{width:100%;max-height:440px;background:#05080d;display:block;border-radius
 <label class="drop" id="drop"><div><div class="cloud">☁</div><strong>Click to upload or drag & drop</strong><span class="muted">MP4, MOV, MKV, AVI, MP3, WAV, M4A</span><div class="muted" id="filename"></div></div><input id="file" type="file" accept="audio/*,video/*" hidden></label>
 </div></div>
 <div class="panel"><div class="panel-head">② Language & AI Model</div><div class="panel-body">
-<div class="field"><label>Source language</label><select id="language"><option value="auto">Auto Detect (100+ languages)</option><option value="en">English</option><option value="hi">Hindi</option><option value="mr">Marathi</option><option value="ur">Urdu</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="ja">Japanese</option><option value="zh">Chinese</option></select></div>
+<div class="field"><label>Source language</label><select id="language"><option value="auto">Auto Detect (100+ languages)</option><option value="en">English</option><option value="hi">Hindi</option><option value="mr">Marathi</option><option value="ur">Urdu</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="ja">Japanese</option><option value="zh">Chinese</option></select><div class="muted">Mostly Hindi speech? Select Hindi manually. Use Auto Detect for mixed-language or unknown speech.</div></div>
 <div class="field"><label>AI Model</label><select id="model"><option value="small">Whisper Small (Balanced)</option><option value="base">Whisper Base (Fast)</option><option value="medium">Whisper Medium (Higher accuracy)</option><option value="large-v3">Whisper Large-v3 (Best accuracy · slow)</option></select></div>
-<div class="field"><label>Transcription engine</label><select id="engine"><option value="local">Local Whisper</option><option value="sarvam">Sarvam Saaras v4 · Hindi / Hinglish / Indian English</option></select><div class="muted">Sarvam needs SARVAM_API_KEY configured in server environment.</div></div><div class="field"><label>Transcription mode</label><select id="quality"><option value="fast">Fast · quickest</option><option value="balanced" selected>Balanced · recommended</option><option value="accurate">Accuracy first · slower</option></select></div>
+<div class="field"><label>Transcription engine</label><select id="engine"><option value="local">Local Whisper</option><option value="sarvam">Sarvam Saaras v4 · Hindi / Hinglish / Indian English</option></select><div class="muted">Sarvam needs SARVAM_API_KEY configured in server environment.</div></div><div class="field"><label>Transcription mode</label><select id="quality"><option value="fast">Fast · quickest</option><option value="balanced" selected>Balanced · recommended</option><option value="accurate">Accuracy first · 2-pass retry · slowest</option></select></div>
 <div class="field"><label>Custom names / vocabulary (optional)</label><input id="vocabulary" type="text" maxlength="800" placeholder="e.g. Mahesh, Khalilabad, Moro Toons"></div>
 <div class="field"><label>Subtitle language / output</label><select id="output"><option value="original">Same as speech (original script)</option><option value="hindi">Hindi translation (Devanagari)</option><option value="hinglish">Hinglish (Roman Hindi)</option><option value="english">English</option></select></div>
 <label class="check"><input type="checkbox" id="punct" checked> Auto punctuation (Whisper)</label>
+<label class="check"><input type="checkbox" id="aiCorrection"> ✨ Optional local AI proofreading (Qwen) · first download ~639 MB</label>
+<div class="muted">AI checks obvious Hindi/Hinglish/English spelling mistakes after Whisper. It keeps uncertain phrases unchanged; it cannot hear the audio itself.</div>
+<div class="field"><label>Maximum words per caption</label><select id="captionWords"><option value="4">4 words · short</option><option value="5" selected>5 words · recommended</option><option value="6">6 words · more text</option></select><div class="muted">Keeps captions compact and easier to read on Shorts and landscape videos.</div></div>
 <div class="field caption-mode"><label>Caption animation / timing</label><select id="captionMode"><option value="sentence">Sentence-wise captions</option><option value="word">Word by word (one word)</option><option value="karaoke">Karaoke (highlight active word)</option></select></div><label class="check"><input type="checkbox" id="words" checked> Word timestamps</label>
-<div class="muted">Speaker separation is not enabled in this starter version.</div>
+<div class="muted" id="qualityHint">Up to 5 words per caption. Accuracy first runs a second overlapping audio pass to catch words missed in the first pass; it takes longer and cannot guarantee every word.</div>
 </div></div>
 <div class="panel"><div class="panel-head">③ Generate captions</div><div class="panel-body"><button class="btn primary" id="generate" style="width:100%;padding:14px" disabled>▶ Generate Captions</button><div class="progress"><i id="bar"></i></div><div class="status" id="status">Choose a media file to begin.</div></div></div>
 </section>
@@ -160,11 +163,12 @@ $('generate').onclick=async()=>{
  let fd=new FormData();
  fd.append('file',file);fd.append('language',$('language').value);
  fd.append('output',$('output').value);fd.append('model_size',$('model').value);
- fd.append('punctuation',$('punct').checked?'true':'false');fd.append('engine',$('engine').value);
+ fd.append('punctuation',$('punct').checked?'true':'false');fd.append('ai_correction',$('aiCorrection').checked?'true':'false');fd.append('engine',$('engine').value);
  fd.append('quality_mode',$('quality').value);fd.append('vocabulary',$('vocabulary').value);
  fd.append('word_timestamps',$('words').checked?'true':'false');
+ fd.append('caption_words',$('captionWords').value);
  button.disabled=true;button.textContent='⏳ Generating…';
- $('status').textContent='Uploading media and starting transcription…';
+ $('status').textContent=$('aiCorrection').checked?'Whisper transcription + optional local Qwen proofreading. First AI use downloads ~639 MB…':($('quality').value==='accurate'?'Accuracy mode: first pass + overlapping retry. This can take several minutes…':'Uploading media and starting Whisper transcription…');
  $('segments').textContent='Transcription is running…';$('count').textContent='Processing';
  $('bar').classList.add('indeterminate');$('bar').style.width='35%';
  const started=Date.now();
@@ -180,7 +184,8 @@ $('generate').onclick=async()=>{
   rows=data.segments.filter(r=>r&&typeof r.text==='string'&&r.text.trim());
   if(!rows.length)throw new Error('The transcription returned empty caption text. Please retry with another model or source language.');
   $('bar').style.width='100%';
-  $('status').textContent='Success · '+(data.language||'language unknown')+' · '+rows.length+' captions';
+  const warningText=Array.isArray(data.warnings)&&data.warnings.length?' · '+data.warnings.join(' '):'';
+  $('status').textContent='Success · '+(data.language||'language unknown')+' · '+rows.length+' captions'+warningText;
   render();$('liveCaption').hidden=false;syncCaption();
  }catch(e){
   rows=[];$('count').textContent='0 lines';
@@ -236,6 +241,7 @@ $('seek').oninput=()=>{if(!$('video').hidden){$('video').currentTime=Number($('s
 $('seek').onchange=syncCaption;window.addEventListener('resize',()=>requestAnimationFrame(fitCaption));
 $('search').oninput=render;$('copy').onclick=async()=>{await navigator.clipboard.writeText(rows.map(r=>r.text).join('\n'));$('copy').textContent='Copied';setTimeout(()=>$('copy').textContent='Copy',1200)};
 $('captionMode').onchange=()=>{captionMode=$('captionMode').value;syncCaption()};
+$('captionWords').onchange=()=>{$('qualityHint').textContent='Up to '+$('captionWords').value+' words per caption. Accuracy first uses a second overlapping audio pass and takes longer.'};
 $('fontsize').oninput=()=>{$('fontval').textContent=$('fontsize').value;applyTemplate()};$('color').oninput=applyTemplate;
 $('liveCaption').addEventListener('pointerdown',e=>{dragging=true;$('liveCaption').setPointerCapture(e.pointerId);e.preventDefault()});
 $('liveCaption').addEventListener('pointermove',e=>{if(!dragging)return;let rect=$('videoStage').getBoundingClientRect();pos.x=Math.max(5,Math.min(95,(e.clientX-rect.left)/rect.width*100));pos.y=Math.max(5,Math.min(95,(e.clientY-rect.top)/rect.height*100));applyTemplate()});

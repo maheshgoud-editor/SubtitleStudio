@@ -1,4 +1,4 @@
-import os, time, tempfile, shutil, json, subprocess, re, requests
+import os, time, tempfile, shutil, json, subprocess, re, requests, difflib, threading, logging
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
@@ -15,6 +15,7 @@ TMP.mkdir(exist_ok=True)
 app = FastAPI(title="Subtitle Studio")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 _models = OrderedDict()
+_models_lock = threading.RLock()
 # Cap how many Whisper models stay loaded in RAM at once. Users can pick
 # different model sizes (base/small/medium/large-v3); without a cap, every
 # distinct size ever requested stays cached forever - large-v3 alone is
@@ -86,36 +87,192 @@ def home():
     return FileResponse(ROOT / "static" / "index.html")
 
 def get_model(size):
-    # Cache loaded models (LRU, capped at MAX_CACHED_MODELS) to avoid
-    # repeated cold starts while still bounding RAM usage.
-    if size in _models:
-        _models.move_to_end(size)
-        return _models[size]
+    # Multiple browser requests can arrive together. Serialize model creation
+    # so two requests do not allocate duplicate multi-GB Whisper instances.
+    with _models_lock:
+        if size in _models:
+            _models.move_to_end(size)
+            return _models[size]
 
-    while len(_models) >= MAX_CACHED_MODELS:
-        _models.popitem(last=False)
+        while len(_models) >= MAX_CACHED_MODELS:
+            _models.popitem(last=False)
 
-    cpu_threads = max(1, min(os.cpu_count() or 2, 8))
-    # GPU support is opt-in only (WHISPER_DEVICE=cuda), not auto-detected.
-    # ctranslate2/faster-whisper can construct a CUDA-targeted model
-    # successfully even when the machine's CUDA/cuBLAS runtime is missing or
-    # broken (e.g. cublas64_12.dll not found on a normal Windows PC without
-    # the CUDA toolkit) - the failure only happens later, lazily, the first
-    # time transcribe() actually runs, which is too late for a try/except
-    # here to catch and fall back cleanly. CPU is the only choice that is
-    # guaranteed to work everywhere, so it stays the default; set
-    # WHISPER_DEVICE=cuda explicitly on a host you've confirmed has a
-    # working CUDA + cuBLAS install.
-    device_pref = os.getenv("WHISPER_DEVICE", "cpu")
-    if device_pref == "cuda":
-        _models[size] = WhisperModel(size, device="cuda", compute_type="float16")
-        return _models[size]
-
-    _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
+        cpu_threads = max(1, min(os.cpu_count() or 2, 8))
+        # GPU is opt-in only. CPU remains the safe default on ordinary Windows PCs.
+        device_pref = os.getenv("WHISPER_DEVICE", "cpu")
+        if device_pref == "cuda":
+            model = WhisperModel(size, device="cuda", compute_type="float16")
+        else:
+            model = WhisperModel(size, device="cpu", compute_type="int8",
                                  cpu_threads=cpu_threads, num_workers=1)
-    return _models[size]
+        _models[size] = model
+        return model
 
-def split_caption_rows(rows, max_words=6):
+
+# ---------------------------------------------------------------------------
+# Optional, fully local transcript proofreader (Qwen GGUF via llama.cpp).
+# The model is downloaded on first use and cached outside the repository.
+_QWEN_REPO = "Qwen/Qwen3-0.6B-GGUF"
+_QWEN_FILE = "qwen3-0.6b-q8_0.gguf"
+_QWEN_URL = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q8_0.gguf"
+_QWEN_PATH = Path(os.getenv("QWEN_MODEL_PATH", str(TMP / _QWEN_FILE)))
+_qwen_model = None
+_qwen_lock = threading.Lock()
+
+def get_qwen_model():
+    global _qwen_model
+    if _qwen_model is not None:
+        return _qwen_model
+    with _qwen_lock:
+        if _qwen_model is not None:
+            return _qwen_model
+        try:
+            from llama_cpp import Llama
+        except ImportError as exc:
+            raise RuntimeError("Local AI package is missing. Rebuild the app image with requirements.txt.") from exc
+        _QWEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not _QWEN_PATH.exists() or _QWEN_PATH.stat().st_size < 600_000_000:
+            partial = _QWEN_PATH.with_suffix(_QWEN_PATH.suffix + ".part")
+            try:
+                with requests.get(_QWEN_URL, stream=True, timeout=(30, 180)) as response:
+                    response.raise_for_status()
+                    total = int(response.headers.get("content-length", "0"))
+                    received = 0
+                    with partial.open("wb") as out:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                out.write(chunk)
+                                received += len(chunk)
+                    if total and received < total * 0.98:
+                        raise RuntimeError("Qwen model download was incomplete. Retry AI correction.")
+                    if received < 600_000_000:
+                        raise RuntimeError("Downloaded Qwen model file is too small or invalid.")
+                partial.replace(_QWEN_PATH)
+            except Exception:
+                partial.unlink(missing_ok=True)
+                raise
+        _qwen_model = Llama(
+            model_path=str(_QWEN_PATH), n_ctx=2048,
+            n_threads=max(2, min(os.cpu_count() or 2, 6)),
+            n_batch=128, verbose=False
+        )
+        return _qwen_model
+
+def _align_corrected_words(row, corrected_text):
+    word_items = [
+        w for w in (row.get("words") or [])
+        if str(w.get("text", "")).strip()
+    ]
+    old_words = [str(w.get("text", "")).strip() for w in word_items]
+    new_words = corrected_text.split()
+    if not old_words or not new_words:
+        return []
+    matcher = difflib.SequenceMatcher(a=[w.casefold() for w in old_words],
+                                      b=[w.casefold() for w in new_words], autojunk=False)
+    mapped = {}
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for oi, nj in zip(range(i1, i2), range(j1, j2)):
+                mapped[nj] = word_items[oi]
+        elif tag == "replace" and i2 > i1:
+            for k, nj in enumerate(range(j1, j2)):
+                mapped[nj] = word_items[min(i1 + min(k, i2-i1-1), i2-1)]
+    start, end = float(row.get("start", 0)), float(row.get("end", 1))
+    duration = max(0.08, end-start)
+    result = []
+    for index, token in enumerate(new_words):
+        old = mapped.get(index)
+        if old:
+            ws, we = float(old.get("start", start)), float(old.get("end", end))
+        else:
+            ws = start + duration * index / len(new_words)
+            we = start + duration * (index+1) / len(new_words)
+        result.append({"start":round(max(start, ws),3),"end":round(min(end, max(ws+0.04,we)),3),"text":token})
+    return result
+
+def ai_proofread_rows(rows, output_language):
+    """Conservative text cleanup. Original ASR stays authoritative on uncertain phrases."""
+    if not rows:
+        return rows
+    model = get_qwen_model()
+    cleaned = []
+    for offset in range(0, len(rows), 6):
+        batch = rows[offset:offset+6]
+        source = [str(row.get("text", "")).strip() for row in batch]
+        payload = json.dumps(source, ensure_ascii=False)
+        system_prompt = (
+            "You are a conservative subtitle proofreader for spoken Hindi, Hinglish and English. "
+            "Correct only clear speech-recognition spelling mistakes, spacing and punctuation. "
+            "Preserve the exact meaning, word order, names, numbers, slang and code-switching. "
+            "Do not translate, summarize, rewrite, add explanations, or invent words. "
+            "If unsure, return the original line unchanged. Return ONLY valid JSON as "
+            '{"segments":[...]} with exactly the same number of strings as the input.'
+        )
+        user_prompt = "Output language: " + str(output_language) + " /no_think\nTranscript lines (JSON): " + payload
+        response = model.create_chat_completion(
+            messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
+            temperature=0.0, top_p=0.2, max_tokens=512
+        )
+        answer = response["choices"][0]["message"]["content"].strip()
+        match = re.search(r"\{.*\}", answer, flags=re.S)
+        try:
+            parsed = json.loads(match.group(0) if match else answer)
+            suggestions = parsed.get("segments") if isinstance(parsed, dict) else None
+        except Exception:
+            suggestions = None
+        for index, row in enumerate(batch):
+            original = source[index]
+            suggestion = suggestions[index].strip() if isinstance(suggestions, list) and len(suggestions)==len(batch) and isinstance(suggestions[index], str) else original
+            # Guard against hallucinations or large rewrites from a small LLM.
+            old_tokens, new_tokens = original.split(), suggestion.split()
+            similarity = difflib.SequenceMatcher(a=original.casefold(), b=suggestion.casefold(), autojunk=False).ratio()
+            if not suggestion or not old_tokens or len(new_tokens) > max(len(old_tokens)+2, int(len(old_tokens)*1.3)) or similarity < 0.48:
+                suggestion = original
+            updated = dict(row)
+            updated["text"] = suggestion
+            if row.get("words"):
+                updated["words"] = _align_corrected_words(row, suggestion)
+            cleaned.append(updated)
+    return cleaned
+
+def _rebalance_short_caption_tail(groups, max_words, min_words=3):
+    """Balance a short final caption across a contiguous suffix without reordering words."""
+    if len(groups) < 2 or len(groups[-1]) >= min_words:
+        return groups
+
+    # Find the suffix after the most recent sentence-ending boundary.
+    start = len(groups) - 1
+    for index in range(len(groups) - 2, -1, -1):
+        previous_last = groups[index][-1]
+        previous_last_text = (
+            str(previous_last.get("text", "")) if isinstance(previous_last, dict)
+            else str(previous_last)
+        ).strip()
+        trailing = previous_last_text.rstrip(chr(34) + "”’)]")
+        if trailing.endswith((".", "!", "?", "।")):
+            break
+        start = index
+
+    suffix = groups[start:]
+    if len(suffix) < 2:
+        return groups
+    items = [item for group in suffix for item in group]
+    group_count = len(suffix)
+    if len(items) < group_count * min_words or len(items) > group_count * max_words:
+        return groups
+
+    base, remainder = divmod(len(items), group_count)
+    rebuilt = []
+    cursor = 0
+    for index in range(group_count):
+        size = base + (1 if index < remainder else 0)
+        rebuilt.append(items[cursor:cursor + size])
+        cursor += size
+    groups[start:] = rebuilt
+    return groups
+
+
+def split_caption_rows(rows, max_words=5):
     """Split transcript segments into short, readable caption groups."""
     result = []
     for row in rows:
@@ -126,6 +283,19 @@ def split_caption_rows(rows, max_words=6):
             word for word in (row.get("words") or [])
             if str(word.get("text", "")).strip()
         ]
+        # Translation/romanization can change the displayed text while Whisper
+        # still supplies word timings in the source language. Re-align those
+        # timings to the final displayed words so caption text is not reverted
+        # to the source language when word timestamps are enabled.
+        if tokens:
+            timed_text = " ".join(str(word.get("text", "")).strip() for word in tokens)
+            if " ".join(timed_text.split()).casefold() != " ".join(text.split()).casefold():
+                aligned = _align_corrected_words(
+                    {"start": row.get("start", 0), "end": row.get("end", 1), "words": tokens},
+                    text,
+                )
+                if aligned:
+                    tokens = aligned
         if tokens:
             groups, current = [], []
             for token in tokens:
@@ -137,6 +307,7 @@ def split_caption_rows(rows, max_words=6):
                     current = []
             if current:
                 groups.append(current)
+            groups = _rebalance_short_caption_tail(groups, max_words)
             for group in groups:
                 group_start = float(group[0].get("start", row.get("start", 0)))
                 group_end = float(group[-1].get("end", row.get("end", group_start + 1)))
@@ -155,10 +326,13 @@ def split_caption_rows(rows, max_words=6):
             start_time = float(row.get("start", 0))
             end_time = max(start_time + 0.08, float(row.get("end", start_time + 1)))
             duration = end_time - start_time
-            for index in range(0, len(parts), max_words):
-                chunk = parts[index:index + max_words]
-                chunk_start = start_time + duration * index / len(parts)
-                chunk_end = start_time + duration * min(index + len(chunk), len(parts)) / len(parts)
+            groups = [parts[index:index + max_words] for index in range(0, len(parts), max_words)]
+            groups = _rebalance_short_caption_tail(groups, max_words)
+            cursor = 0
+            for chunk in groups:
+                chunk_start = start_time + duration * cursor / len(parts)
+                cursor += len(chunk)
+                chunk_end = start_time + duration * cursor / len(parts)
                 result.append({
                     "id": len(result) + 1,
                     "start": round(chunk_start, 3),
@@ -209,14 +383,16 @@ def translate_text(text, target, source_language):
 @app.post("/api/transcribe")
 async def transcribe(request: Request, file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
-                     punctuation: str = Form("true"), quality_mode: str = Form("balanced"),
-                     vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local")):
+                     punctuation: str = Form("true"), quality_mode: str = Form("balanced"), ai_correction: str = Form("false"),
+                     vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local"),
+                     caption_words: int = Form(5)):
     enforce_rate_limit(request)
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in allowed: raise HTTPException(400, "Unsupported media format.")
     if output not in {"original","hindi","hinglish","english"}: output = "original"
     if model_size not in {"base","small","medium","large-v3"}: model_size = "small"
+    caption_words = max(3, min(int(caption_words), 6))
     tmp_path = TMP / (next(tempfile._get_candidate_names()) + suffix)
     try:
         await save_upload_limited(file, tmp_path)
@@ -264,7 +440,7 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             if output in {"english", "hindi", "hinglish"}:
                 for row in rows:
                     row["text"] = translate_text(row["text"], output, detected)
-            rows = split_caption_rows(rows, 6)
+            rows = split_caption_rows(rows, caption_words)
             return {"language":detected,"language_probability":None,"segments":rows,"message":"Sarvam transcription complete","engine":"sarvam"}
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
@@ -276,7 +452,18 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             # into Hindi script even though English was requested.
             prompt_parts.append("Translate the speech into clear, natural English.")
         elif language == "hi":
-            prompt_parts.append("यह स्वाभाविक बोलचाल की हिंदी है। हिंदी शब्दों को देवनागरी में लिखें और अंग्रेज़ी शब्दों को अनावश्यक रूप से हिंदी में न बदलें।")
+            prompt_parts.append(
+                "यह स्वाभाविक बोलचाल की हिंदी, Hinglish या क्षेत्रीय लहजे वाली बातचीत हो सकती है। "
+                "जो शब्द वास्तव में बोले गए हैं वही लिखें; हिंदी को देवनागरी में रखें, "
+                "स्पष्ट अंग्रेज़ी शब्दों को Latin script में रखें, और Bhojpuri/स्थानीय शब्दों को "
+                "बिना वजह शुद्ध हिंदी में न बदलें। नाम और अर्थ का अनुमान न लगाएँ।"
+            )
+        elif language == "auto":
+            prompt_parts.append(
+                "Detect the spoken language from the audio. If the speech is Hindi or Hinglish, "
+                "write Hindi words in Devanagari, preserve clearly spoken English words in Latin script, "
+                "and keep regional/colloquial wording as spoken. Do not translate or invent words."
+            )
         elif language == "en":
             prompt_parts.append("Transcribe clearly with natural English punctuation.")
         if punctuation.lower() != "true":
@@ -290,62 +477,124 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
         if model_size == "base":
             beam = min(beam, 2)
         def run_local_transcription():
-            # faster-whisper's transcribe() + segment iteration is pure CPU
-            # work and takes real time (seconds to minutes). Running it
-            # directly inside this async endpoint would block the single
-            # asyncio event loop, freezing the whole server - including
-            # every other visitor's page loads and requests - for as long
-            # as this one transcription runs. Doing it in a worker thread
-            # (via run_in_threadpool below) keeps the server responsive for
-            # everyone else while this request is processed.
-            segments, info = model.transcribe(
-                str(tmp_path), language=lang, task=task,
-                word_timestamps=word_timestamps.lower() == "true", vad_filter=True,
-                # Lower VAD threshold + shorter min-silence + more pre/post padding
-                # so quiet or quick words right at a pause aren't trimmed away as
-                # "silence" before Whisper ever sees them.
-                vad_parameters={
-                    "threshold": 0.35,
-                    "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 400,
-                },
-                beam_size=beam, best_of=1, patience=1, temperature=0,
-                # Default thresholds are tuned for clean studio audio and will
-                # silently drop low-confidence segments (which looks like
-                # "missing words" in the captions). Relax them so marginal
-                # speech is still transcribed instead of discarded.
-                no_speech_threshold=0.75,
-                log_prob_threshold=-1.5,
-                compression_ratio_threshold=2.6,
-                condition_on_previous_text=(quality_mode == "accurate"), initial_prompt=prompt
-            )
-            local_rows = []
-            for seg in segments:
-                original = seg.text.strip()
-                source_lang = "hi" if language == "hi" else info.language
-                converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
-                words = []
-                if seg.words:
-                    for w in seg.words:
-                        word_text = w.word.strip()
-                        if output == "hinglish" and source_lang == "hi":
-                            word_text = romanize_devanagari(word_text)
-                        elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
-                            word_text = translate_text(word_text, "hindi", "ur")
-                        words.append({"start":round(w.start,3),"end":round(w.end,3),"text":word_text})
-                local_rows.append({"id":len(local_rows)+1,"start":round(seg.start,3),"end":round(seg.end,3),
-                             "text":converted,"words":words})
-            return local_rows, info
+            # Inference runs in a worker thread so CPU-heavy decoding never
+            # blocks the FastAPI event loop.
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+            def decode(audio_path, offset=0.0, chunk_mode=False):
+                options = {
+                    "language": lang, "task": task,
+                    "word_timestamps": word_timestamps.lower() == "true",
+                    "vad_filter": not chunk_mode,
+                    "beam_size": 5 if chunk_mode else beam,
+                    "best_of": 3 if chunk_mode else 1,
+                    "patience": 1,
+                    "temperature": [0, 0.2] if chunk_mode else 0,
+                    "no_speech_threshold": 0.8 if chunk_mode else 0.75,
+                    "log_prob_threshold": -1.5,
+                    "compression_ratio_threshold": 2.6,
+                    "condition_on_previous_text": False if chunk_mode else (quality_mode == "accurate"),
+                    "initial_prompt": prompt,
+                }
+                if not chunk_mode:
+                    options["vad_parameters"] = {
+                        "threshold": 0.35, "min_silence_duration_ms": 300,
+                        "speech_pad_ms": 500,
+                    }
+                segments, info = model.transcribe(str(audio_path), **options)
+                found = []
+                for seg in segments:
+                    original = seg.text.strip()
+                    if not original:
+                        continue
+                    source_lang = "hi" if language == "hi" else info.language
+                    converted = translate_text(original, output, source_lang) if output in {"hindi","hinglish","english"} else original
+                    words = []
+                    if seg.words:
+                        for w in seg.words:
+                            word_text = w.word.strip()
+                            if output == "hinglish" and source_lang == "hi":
+                                word_text = romanize_devanagari(word_text)
+                            elif output == "hindi" and source_lang == "hi" and any(0x0600 <= ord(ch) <= 0x06ff for ch in word_text):
+                                word_text = translate_text(word_text, "hindi", "ur")
+                            words.append({"start":round(offset+w.start,3),"end":round(offset+w.end,3),"text":word_text})
+                    found.append({"id":len(found)+1,"start":round(offset+seg.start,3),
+                                  "end":round(offset+seg.end,3),"text":converted,"words":words})
+                return found, info
+
+            # Pass 1: full-file Whisper transcription.
+            first_pass, info = decode(tmp_path)
+            if quality_mode != "accurate":
+                return first_pass, info
+
+            # Pass 2: re-decode overlapping 30-second chunks with a stronger
+            # beam and no VAD. This can recover quiet/fast words dropped by
+            # full-file VAD and reduces long-context omissions.
+            probe = subprocess.run([ffmpeg, "-i", str(tmp_path)], capture_output=True,
+                                   text=True, timeout=30)
+            match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr or "")
+            if not match:
+                return first_pass, info
+            duration = int(match.group(1))*3600 + int(match.group(2))*60 + float(match.group(3))
+            chunk_rows, offset = [], 0.0
+            chunk_size, overlap = 30.0, 2.0
+            while offset < duration:
+                length = min(chunk_size, duration-offset)
+                wav_path = TMP / (next(tempfile._get_candidate_names()) + ".wav")
+                try:
+                    proc = subprocess.run(
+                        [ffmpeg, "-y", "-ss", str(offset), "-i", str(tmp_path), "-t", str(length),
+                         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path)],
+                        capture_output=True, text=True, timeout=180)
+                    if proc.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 1000:
+                        part, _ = decode(wav_path, offset, chunk_mode=True)
+                        core_start = offset if offset == 0 else offset + overlap
+                        core_end = offset + length if offset + length >= duration else offset + length - overlap
+                        for row in part:
+                            midpoint = (row["start"] + row["end"]) / 2
+                            if core_start <= midpoint < core_end or (offset+length >= duration and midpoint <= core_end):
+                                chunk_rows.append(row)
+                finally:
+                    wav_path.unlink(missing_ok=True)
+                offset += chunk_size-overlap
+
+            # Never append both transcripts (which duplicates speech). Prefer
+            # the chunk pass only when it is non-empty and contains at least as
+            # many recognized words; otherwise preserve the full-file result.
+            count_words = lambda items: sum(len(re.findall(r"\S+", row["text"])) for row in items)
+            if chunk_rows and count_words(chunk_rows) >= count_words(first_pass):
+                return chunk_rows, info
+            return first_pass, info
 
         rows, info = await run_in_threadpool(run_local_transcription)
-        caption_rows = split_caption_rows(rows, 6)
+        warnings = []
+        if ai_correction.lower() == "true":
+            try:
+                rows = await run_in_threadpool(
+                    ai_proofread_rows, rows,
+                    output if output != "original" else (language if language != "auto" else info.language)
+                )
+            except Exception as proofread_error:
+                # Proofreading is optional: a missing native DLL, failed first-time
+                # model download, or Qwen load error must never discard a valid
+                # Whisper transcript or turn caption generation into HTTP 500.
+                logging.exception("Optional Qwen proofreading failed; keeping original Whisper transcript")
+                warnings.append(
+                    "AI proofreading was skipped; original Whisper captions are kept. "
+                    f"Reason: {type(proofread_error).__name__}: {proofread_error}"
+                )
+        caption_rows = split_caption_rows(rows, caption_words)
         if not caption_rows:
-            raise RuntimeError("No speech was detected. Try another audio file or select the spoken source language manually.")
+            raise HTTPException(422, "No speech was detected. Try another audio file or select the spoken source language manually.")
         return {"language":info.language,"language_probability":round(info.language_probability,3),
-                "segments":caption_rows,"message":"Transcription complete"}
-    except HTTPException: raise
+                "segments":caption_rows,"warnings":warnings,"message":"Transcription complete"}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, f"Transcription failed: {str(e)}")
+        # Keep the full traceback in the launcher console so packaged Windows
+        # builds expose the real cause instead of only returning a generic 500.
+        logging.exception("SubtitleStudio transcription failed")
+        raise HTTPException(500, f"Transcription failed: {type(e).__name__}: {str(e)}")
     finally:
         try: tmp_path.unlink(missing_ok=True)
         except Exception: pass

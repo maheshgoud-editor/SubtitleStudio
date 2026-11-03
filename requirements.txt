@@ -6,3 +6,4 @@ deep-translator>=1.11.4
 imageio-ffmpeg>=0.5.1
 indic-transliteration>=2.3.70
 requests>=2.31
+llama-cpp-python>=0.3.20,<0.4
