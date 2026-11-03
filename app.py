@@ -217,7 +217,7 @@ def ai_proofread_rows(rows, output_language):
             temperature=0.0, top_p=0.2, max_tokens=512
         )
         answer = response["choices"][0]["message"]["content"].strip()
-        match = re.search(r"\\{.*\\}", answer, flags=re.S)
+        match = re.search(r"\{.*\}", answer, flags=re.S)
         try:
             parsed = json.loads(match.group(0) if match else answer)
             suggestions = parsed.get("segments") if isinstance(parsed, dict) else None
