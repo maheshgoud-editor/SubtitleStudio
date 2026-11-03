@@ -1,4 +1,4 @@
-import os, time, tempfile, shutil, json, subprocess, re, requests
+import os, time, tempfile, shutil, json, subprocess, re, requests, difflib, threading
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
@@ -115,6 +115,129 @@ def get_model(size):
                                  cpu_threads=cpu_threads, num_workers=1)
     return _models[size]
 
+
+# ---------------------------------------------------------------------------
+# Optional, fully local transcript proofreader (Qwen GGUF via llama.cpp).
+# The model is downloaded on first use and cached outside the repository.
+_QWEN_REPO = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+_QWEN_FILE = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+_QWEN_URL = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+_QWEN_PATH = Path(os.getenv("QWEN_MODEL_PATH", str(TMP / _QWEN_FILE)))
+_qwen_model = None
+_qwen_lock = threading.Lock()
+
+def get_qwen_model():
+    global _qwen_model
+    if _qwen_model is not None:
+        return _qwen_model
+    with _qwen_lock:
+        if _qwen_model is not None:
+            return _qwen_model
+        try:
+            from llama_cpp import Llama
+        except ImportError as exc:
+            raise RuntimeError("Local AI package is missing. Rebuild the app image with requirements.txt.") from exc
+        _QWEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not _QWEN_PATH.exists() or _QWEN_PATH.stat().st_size < 400_000_000:
+            partial = _QWEN_PATH.with_suffix(_QWEN_PATH.suffix + ".part")
+            try:
+                with requests.get(_QWEN_URL, stream=True, timeout=(30, 180)) as response:
+                    response.raise_for_status()
+                    total = int(response.headers.get("content-length", "0"))
+                    received = 0
+                    with partial.open("wb") as out:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                out.write(chunk)
+                                received += len(chunk)
+                    if total and received < total * 0.98:
+                        raise RuntimeError("Qwen model download was incomplete. Retry AI correction.")
+                    if received < 400_000_000:
+                        raise RuntimeError("Downloaded Qwen model file is too small or invalid.")
+                partial.replace(_QWEN_PATH)
+            except Exception:
+                partial.unlink(missing_ok=True)
+                raise
+        _qwen_model = Llama(
+            model_path=str(_QWEN_PATH), n_ctx=2048,
+            n_threads=max(2, min(os.cpu_count() or 2, 6)),
+            n_batch=128, verbose=False
+        )
+        return _qwen_model
+
+def _align_corrected_words(row, corrected_text):
+    old_words = [str(w.get("text", "")).strip() for w in (row.get("words") or []) if str(w.get("text", "")).strip()]
+    new_words = corrected_text.split()
+    if not old_words or not new_words:
+        return []
+    matcher = difflib.SequenceMatcher(a=[w.casefold() for w in old_words],
+                                      b=[w.casefold() for w in new_words], autojunk=False)
+    mapped = {}
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for oi, nj in zip(range(i1, i2), range(j1, j2)):
+                mapped[nj] = row["words"][oi]
+        elif tag == "replace" and i2 > i1:
+            for k, nj in enumerate(range(j1, j2)):
+                mapped[nj] = row["words"][min(i1 + min(k, i2-i1-1), i2-1)]
+    start, end = float(row.get("start", 0)), float(row.get("end", 1))
+    duration = max(0.08, end-start)
+    result = []
+    for index, token in enumerate(new_words):
+        old = mapped.get(index)
+        if old:
+            ws, we = float(old.get("start", start)), float(old.get("end", end))
+        else:
+            ws = start + duration * index / len(new_words)
+            we = start + duration * (index+1) / len(new_words)
+        result.append({"start":round(max(start, ws),3),"end":round(min(end, max(ws+0.04,we)),3),"text":token})
+    return result
+
+def ai_proofread_rows(rows, output_language):
+    """Conservative text cleanup. Original ASR stays authoritative on uncertain phrases."""
+    if not rows:
+        return rows
+    model = get_qwen_model()
+    cleaned = []
+    for offset in range(0, len(rows), 6):
+        batch = rows[offset:offset+6]
+        source = [str(row.get("text", "")).strip() for row in batch]
+        payload = json.dumps(source, ensure_ascii=False)
+        system_prompt = (
+            "You are a conservative subtitle proofreader for spoken Hindi, Hinglish and English. "
+            "Correct only clear speech-recognition spelling mistakes, spacing and punctuation. "
+            "Preserve the exact meaning, word order, names, numbers, slang and code-switching. "
+            "Do not translate, summarize, rewrite, add explanations, or invent words. "
+            "If unsure, return the original line unchanged. Return ONLY valid JSON as "
+            "{\\"segments\\":[...]} with exactly the same number of strings as the input."
+        )
+        user_prompt = "Output language: " + str(output_language) + "\\nTranscript lines (JSON): " + payload
+        response = model.create_chat_completion(
+            messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
+            temperature=0.0, top_p=0.2, max_tokens=512
+        )
+        answer = response["choices"][0]["message"]["content"].strip()
+        match = re.search(r"\\{.*\\}", answer, flags=re.S)
+        try:
+            parsed = json.loads(match.group(0) if match else answer)
+            suggestions = parsed.get("segments") if isinstance(parsed, dict) else None
+        except Exception:
+            suggestions = None
+        for index, row in enumerate(batch):
+            original = source[index]
+            suggestion = suggestions[index].strip() if isinstance(suggestions, list) and len(suggestions)==len(batch) and isinstance(suggestions[index], str) else original
+            # Guard against hallucinations or large rewrites from a small LLM.
+            old_tokens, new_tokens = original.split(), suggestion.split()
+            similarity = difflib.SequenceMatcher(a=original.casefold(), b=suggestion.casefold(), autojunk=False).ratio()
+            if not suggestion or not old_tokens or len(new_tokens) > max(len(old_tokens)+2, int(len(old_tokens)*1.3)) or similarity < 0.48:
+                suggestion = original
+            updated = dict(row)
+            updated["text"] = suggestion
+            if row.get("words"):
+                updated["words"] = _align_corrected_words(row, suggestion)
+            cleaned.append(updated)
+    return cleaned
+
 def split_caption_rows(rows, max_words=6):
     """Split transcript segments into short, readable caption groups."""
     result = []
@@ -209,7 +332,7 @@ def translate_text(text, target, source_language):
 @app.post("/api/transcribe")
 async def transcribe(request: Request, file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
-                     punctuation: str = Form("true"), quality_mode: str = Form("balanced"),
+                     punctuation: str = Form("true"), quality_mode: str = Form("balanced"), ai_correction: str = Form("false"),
                      vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local")):
     enforce_rate_limit(request)
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
@@ -380,6 +503,8 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             return first_pass, info
 
         rows, info = await run_in_threadpool(run_local_transcription)
+        if ai_correction.lower() == "true":
+            rows = await run_in_threadpool(ai_proofread_rows, rows, output if output != "original" else (language if language != "auto" else info.language))
         caption_rows = split_caption_rows(rows, 6)
         if not caption_rows:
             raise RuntimeError("No speech was detected. Try another audio file or select the spoken source language manually.")
