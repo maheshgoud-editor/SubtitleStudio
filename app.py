@@ -327,7 +327,7 @@ def split_caption_rows(rows, max_words=5):
             end_time = max(start_time + 0.08, float(row.get("end", start_time + 1)))
             duration = end_time - start_time
             groups = [parts[index:index + max_words] for index in range(0, len(parts), max_words)]
-            groups = _rebalance_short_caption_tail(groups)
+            groups = _rebalance_short_caption_tail(groups, max_words)
             cursor = 0
             for chunk in groups:
                 chunk_start = start_time + duration * cursor / len(parts)
