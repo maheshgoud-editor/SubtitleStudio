@@ -119,8 +119,8 @@ def get_model(size):
 # ---------------------------------------------------------------------------
 # Optional, fully local transcript proofreader (Qwen GGUF via llama.cpp).
 # The model is downloaded on first use and cached outside the repository.
-_QWEN_REPO = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
-_QWEN_FILE = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+_QWEN_REPO = "Qwen/Qwen3-0.6B-GGUF"
+_QWEN_FILE = "qwen3-0.6b-q8_0.gguf"
 _QWEN_URL = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 _QWEN_PATH = Path(os.getenv("QWEN_MODEL_PATH", str(TMP / _QWEN_FILE)))
 _qwen_model = None
@@ -138,7 +138,7 @@ def get_qwen_model():
         except ImportError as exc:
             raise RuntimeError("Local AI package is missing. Rebuild the app image with requirements.txt.") from exc
         _QWEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if not _QWEN_PATH.exists() or _QWEN_PATH.stat().st_size < 400_000_000:
+        if not _QWEN_PATH.exists() or _QWEN_PATH.stat().st_size < 600_000_000:
             partial = _QWEN_PATH.with_suffix(_QWEN_PATH.suffix + ".part")
             try:
                 with requests.get(_QWEN_URL, stream=True, timeout=(30, 180)) as response:
@@ -152,7 +152,7 @@ def get_qwen_model():
                                 received += len(chunk)
                     if total and received < total * 0.98:
                         raise RuntimeError("Qwen model download was incomplete. Retry AI correction.")
-                    if received < 400_000_000:
+                    if received < 600_000_000:
                         raise RuntimeError("Downloaded Qwen model file is too small or invalid.")
                 partial.replace(_QWEN_PATH)
             except Exception:
@@ -211,7 +211,7 @@ def ai_proofread_rows(rows, output_language):
             "If unsure, return the original line unchanged. Return ONLY valid JSON as "
             '{"segments":[...]} with exactly the same number of strings as the input.'
         )
-        user_prompt = "Output language: " + str(output_language) + "\nTranscript lines (JSON): " + payload
+        user_prompt = "Output language: " + str(output_language) + " /no_think\nTranscript lines (JSON): " + payload
         response = model.create_chat_completion(
             messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
             temperature=0.0, top_p=0.2, max_tokens=512
