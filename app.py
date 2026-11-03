@@ -121,7 +121,7 @@ def get_model(size):
 # The model is downloaded on first use and cached outside the repository.
 _QWEN_REPO = "Qwen/Qwen3-0.6B-GGUF"
 _QWEN_FILE = "qwen3-0.6b-q8_0.gguf"
-_QWEN_URL = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+_QWEN_URL = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q8_0.gguf"
 _QWEN_PATH = Path(os.getenv("QWEN_MODEL_PATH", str(TMP / _QWEN_FILE)))
 _qwen_model = None
 _qwen_lock = threading.Lock()
