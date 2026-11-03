@@ -15,6 +15,7 @@ TMP.mkdir(exist_ok=True)
 app = FastAPI(title="Subtitle Studio")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 _models = OrderedDict()
+_models_lock = threading.RLock()
 # Cap how many Whisper models stay loaded in RAM at once. Users can pick
 # different model sizes (base/small/medium/large-v3); without a cap, every
 # distinct size ever requested stays cached forever - large-v3 alone is
@@ -86,34 +87,26 @@ def home():
     return FileResponse(ROOT / "static" / "index.html")
 
 def get_model(size):
-    # Cache loaded models (LRU, capped at MAX_CACHED_MODELS) to avoid
-    # repeated cold starts while still bounding RAM usage.
-    if size in _models:
-        _models.move_to_end(size)
-        return _models[size]
+    # Multiple browser requests can arrive together. Serialize model creation
+    # so two requests do not allocate duplicate multi-GB Whisper instances.
+    with _models_lock:
+        if size in _models:
+            _models.move_to_end(size)
+            return _models[size]
 
-    while len(_models) >= MAX_CACHED_MODELS:
-        _models.popitem(last=False)
+        while len(_models) >= MAX_CACHED_MODELS:
+            _models.popitem(last=False)
 
-    cpu_threads = max(1, min(os.cpu_count() or 2, 8))
-    # GPU support is opt-in only (WHISPER_DEVICE=cuda), not auto-detected.
-    # ctranslate2/faster-whisper can construct a CUDA-targeted model
-    # successfully even when the machine's CUDA/cuBLAS runtime is missing or
-    # broken (e.g. cublas64_12.dll not found on a normal Windows PC without
-    # the CUDA toolkit) - the failure only happens later, lazily, the first
-    # time transcribe() actually runs, which is too late for a try/except
-    # here to catch and fall back cleanly. CPU is the only choice that is
-    # guaranteed to work everywhere, so it stays the default; set
-    # WHISPER_DEVICE=cuda explicitly on a host you've confirmed has a
-    # working CUDA + cuBLAS install.
-    device_pref = os.getenv("WHISPER_DEVICE", "cpu")
-    if device_pref == "cuda":
-        _models[size] = WhisperModel(size, device="cuda", compute_type="float16")
-        return _models[size]
-
-    _models[size] = WhisperModel(size, device="cpu", compute_type="int8",
+        cpu_threads = max(1, min(os.cpu_count() or 2, 8))
+        # GPU is opt-in only. CPU remains the safe default on ordinary Windows PCs.
+        device_pref = os.getenv("WHISPER_DEVICE", "cpu")
+        if device_pref == "cuda":
+            model = WhisperModel(size, device="cuda", compute_type="float16")
+        else:
+            model = WhisperModel(size, device="cpu", compute_type="int8",
                                  cpu_threads=cpu_threads, num_workers=1)
-    return _models[size]
+        _models[size] = model
+        return model
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +231,7 @@ def ai_proofread_rows(rows, output_language):
             cleaned.append(updated)
     return cleaned
 
-def split_caption_rows(rows, max_words=6):
+def split_caption_rows(rows, max_words=5):
     """Split transcript segments into short, readable caption groups."""
     result = []
     for row in rows:
@@ -249,6 +242,19 @@ def split_caption_rows(rows, max_words=6):
             word for word in (row.get("words") or [])
             if str(word.get("text", "")).strip()
         ]
+        # Translation/romanization can change the displayed text while Whisper
+        # still supplies word timings in the source language. Re-align those
+        # timings to the final displayed words so caption text is not reverted
+        # to the source language when word timestamps are enabled.
+        if tokens:
+            timed_text = " ".join(str(word.get("text", "")).strip() for word in tokens)
+            if " ".join(timed_text.split()).casefold() != " ".join(text.split()).casefold():
+                aligned = _align_corrected_words(
+                    {"start": row.get("start", 0), "end": row.get("end", 1), "words": tokens},
+                    text,
+                )
+                if aligned:
+                    tokens = aligned
         if tokens:
             groups, current = [], []
             for token in tokens:
@@ -333,13 +339,15 @@ def translate_text(text, target, source_language):
 async def transcribe(request: Request, file: UploadFile = File(...), language: str = Form("auto"),
                      output: str = Form("original"), model_size: str = Form("small"),
                      punctuation: str = Form("true"), quality_mode: str = Form("balanced"), ai_correction: str = Form("false"),
-                     vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local")):
+                     vocabulary: str = Form(""), word_timestamps: str = Form("true"), engine: str = Form("local"),
+                     caption_words: int = Form(5)):
     enforce_rate_limit(request)
     allowed = {".mp3",".mp4",".wav",".m4a",".mov",".mkv",".webm",".aac",".flac",".ogg",".avi"}
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in allowed: raise HTTPException(400, "Unsupported media format.")
     if output not in {"original","hindi","hinglish","english"}: output = "original"
     if model_size not in {"base","small","medium","large-v3"}: model_size = "small"
+    caption_words = max(3, min(int(caption_words), 6))
     tmp_path = TMP / (next(tempfile._get_candidate_names()) + suffix)
     try:
         await save_upload_limited(file, tmp_path)
@@ -387,7 +395,7 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
             if output in {"english", "hindi", "hinglish"}:
                 for row in rows:
                     row["text"] = translate_text(row["text"], output, detected)
-            rows = split_caption_rows(rows, 6)
+            rows = split_caption_rows(rows, caption_words)
             return {"language":detected,"language_probability":None,"segments":rows,"message":"Sarvam transcription complete","engine":"sarvam"}
         model = get_model(model_size)
         task = "translate" if output == "english" else "transcribe"
@@ -519,7 +527,7 @@ async def transcribe(request: Request, file: UploadFile = File(...), language: s
                     "AI proofreading was skipped; original Whisper captions are kept. "
                     f"Reason: {type(proofread_error).__name__}: {proofread_error}"
                 )
-        caption_rows = split_caption_rows(rows, 6)
+        caption_rows = split_caption_rows(rows, caption_words)
         if not caption_rows:
             raise HTTPException(422, "No speech was detected. Try another audio file or select the spoken source language manually.")
         return {"language":info.language,"language_probability":round(info.language_probability,3),
