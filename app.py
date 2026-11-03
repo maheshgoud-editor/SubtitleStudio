@@ -236,25 +236,30 @@ def ai_proofread_rows(rows, output_language):
     return cleaned
 
 def _rebalance_short_caption_tail(groups, min_words=3):
-    """Avoid a one- or two-word final caption when a neighbouring group can share words."""
+    """Avoid tiny final captions by borrowing from earlier groups without crossing sentence ends."""
     if len(groups) < 2 or len(groups[-1]) >= min_words:
         return groups
-    previous = groups[-2]
-    if len(previous) <= min_words:
-        return groups
-    previous_last = previous[-1]
-    previous_last_text = (
-        str(previous_last.get("text", "")) if isinstance(previous_last, dict)
-        else str(previous_last)
-    ).strip()
-    # Do not move words across an actual sentence-ending punctuation boundary.
-    trailing = previous_last_text.rstrip(chr(34) + "”’)]")
-    if trailing.endswith((".", "!", "?", "।")):
-        return groups
-    move = min(min_words - len(groups[-1]), len(previous) - min_words)
-    if move > 0:
-        groups[-2] = previous[:-move]
-        groups[-1] = previous[-move:] + groups[-1]
+    needed = min_words - len(groups[-1])
+    for index in range(len(groups) - 2, -1, -1):
+        previous = groups[index]
+        if len(previous) <= min_words:
+            continue
+        previous_last = previous[-1]
+        previous_last_text = (
+            str(previous_last.get("text", "")) if isinstance(previous_last, dict)
+            else str(previous_last)
+        ).strip()
+        trailing = previous_last_text.rstrip(chr(34) + "”’)]")
+        # Do not move words across an actual sentence-ending punctuation boundary.
+        if trailing.endswith((".", "!", "?", "।")):
+            break
+        move = min(needed, len(previous) - min_words)
+        if move:
+            groups[-1] = previous[-move:] + groups[-1]
+            groups[index] = previous[:-move]
+            needed -= move
+        if needed <= 0:
+            break
     return groups
 
 
