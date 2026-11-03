@@ -91,12 +91,12 @@ video{width:100%;max-height:440px;background:#05080d;display:block;border-radius
 <div class="panel"><div class="panel-head">② Language & AI Model</div><div class="panel-body">
 <div class="field"><label>Source language</label><select id="language"><option value="auto">Auto Detect (100+ languages)</option><option value="en">English</option><option value="hi">Hindi</option><option value="mr">Marathi</option><option value="ur">Urdu</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="ja">Japanese</option><option value="zh">Chinese</option></select></div>
 <div class="field"><label>AI Model</label><select id="model"><option value="small">Whisper Small (Balanced)</option><option value="base">Whisper Base (Fast)</option><option value="medium">Whisper Medium (Higher accuracy)</option><option value="large-v3">Whisper Large-v3 (Best accuracy · slow)</option></select></div>
-<div class="field"><label>Transcription engine</label><select id="engine"><option value="local">Local Whisper</option><option value="sarvam">Sarvam Saaras v4 · Hindi / Hinglish / Indian English</option></select><div class="muted">Sarvam needs SARVAM_API_KEY configured in server environment.</div></div><div class="field"><label>Transcription mode</label><select id="quality"><option value="fast">Fast · quickest</option><option value="balanced" selected>Balanced · recommended</option><option value="accurate">Accuracy first · slower</option></select></div>
+<div class="field"><label>Transcription engine</label><select id="engine"><option value="local">Local Whisper</option><option value="sarvam">Sarvam Saaras v4 · Hindi / Hinglish / Indian English</option></select><div class="muted">Sarvam needs SARVAM_API_KEY configured in server environment.</div></div><div class="field"><label>Transcription mode</label><select id="quality"><option value="fast">Fast · quickest</option><option value="balanced" selected>Balanced · recommended</option><option value="accurate">Accuracy first · 2-pass retry · slowest</option></select></div>
 <div class="field"><label>Custom names / vocabulary (optional)</label><input id="vocabulary" type="text" maxlength="800" placeholder="e.g. Mahesh, Khalilabad, Moro Toons"></div>
 <div class="field"><label>Subtitle language / output</label><select id="output"><option value="original">Same as speech (original script)</option><option value="hindi">Hindi translation (Devanagari)</option><option value="hinglish">Hinglish (Roman Hindi)</option><option value="english">English</option></select></div>
 <label class="check"><input type="checkbox" id="punct" checked> Auto punctuation (Whisper)</label>
 <div class="field caption-mode"><label>Caption animation / timing</label><select id="captionMode"><option value="sentence">Sentence-wise captions</option><option value="word">Word by word (one word)</option><option value="karaoke">Karaoke (highlight active word)</option></select></div><label class="check"><input type="checkbox" id="words" checked> Word timestamps</label>
-<div class="muted">Speaker separation is not enabled in this starter version.</div>
+<div class="muted" id="qualityHint">Accuracy first runs a second overlapping audio pass to catch words missed in the first pass. It takes longer and cannot guarantee every word.</div>
 </div></div>
 <div class="panel"><div class="panel-head">③ Generate captions</div><div class="panel-body"><button class="btn primary" id="generate" style="width:100%;padding:14px" disabled>▶ Generate Captions</button><div class="progress"><i id="bar"></i></div><div class="status" id="status">Choose a media file to begin.</div></div></div>
 </section>
@@ -164,7 +164,7 @@ $('generate').onclick=async()=>{
  fd.append('quality_mode',$('quality').value);fd.append('vocabulary',$('vocabulary').value);
  fd.append('word_timestamps',$('words').checked?'true':'false');
  button.disabled=true;button.textContent='⏳ Generating…';
- $('status').textContent='Uploading media and starting transcription…';
+ $('status').textContent=$('quality').value==='accurate'?'Accuracy mode: first pass + overlapping retry. This can take several minutes…':'Uploading media and starting transcription…';
  $('segments').textContent='Transcription is running…';$('count').textContent='Processing';
  $('bar').classList.add('indeterminate');$('bar').style.width='35%';
  const started=Date.now();
