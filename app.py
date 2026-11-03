@@ -159,7 +159,11 @@ def get_qwen_model():
         return _qwen_model
 
 def _align_corrected_words(row, corrected_text):
-    old_words = [str(w.get("text", "")).strip() for w in (row.get("words") or []) if str(w.get("text", "")).strip()]
+    word_items = [
+        w for w in (row.get("words") or [])
+        if str(w.get("text", "")).strip()
+    ]
+    old_words = [str(w.get("text", "")).strip() for w in word_items]
     new_words = corrected_text.split()
     if not old_words or not new_words:
         return []
@@ -169,10 +173,10 @@ def _align_corrected_words(row, corrected_text):
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for oi, nj in zip(range(i1, i2), range(j1, j2)):
-                mapped[nj] = row["words"][oi]
+                mapped[nj] = word_items[oi]
         elif tag == "replace" and i2 > i1:
             for k, nj in enumerate(range(j1, j2)):
-                mapped[nj] = row["words"][min(i1 + min(k, i2-i1-1), i2-1)]
+                mapped[nj] = word_items[min(i1 + min(k, i2-i1-1), i2-1)]
     start, end = float(row.get("start", 0)), float(row.get("end", 1))
     duration = max(0.08, end-start)
     result = []
@@ -231,6 +235,28 @@ def ai_proofread_rows(rows, output_language):
             cleaned.append(updated)
     return cleaned
 
+def _rebalance_short_caption_tail(groups, min_words=3):
+    """Avoid a one- or two-word final caption when a neighbouring group can share words."""
+    if len(groups) < 2 or len(groups[-1]) >= min_words:
+        return groups
+    previous = groups[-2]
+    if len(previous) <= min_words:
+        return groups
+    previous_last = previous[-1]
+    previous_last_text = (
+        str(previous_last.get("text", "")) if isinstance(previous_last, dict)
+        else str(previous_last)
+    ).strip()
+    # Do not move words across an actual sentence-ending punctuation boundary.
+    if re.search(r"[.!?।][\\"'”’)]*$", previous_last_text):
+        return groups
+    move = min(min_words - len(groups[-1]), len(previous) - min_words)
+    if move > 0:
+        groups[-2] = previous[:-move]
+        groups[-1] = previous[-move:] + groups[-1]
+    return groups
+
+
 def split_caption_rows(rows, max_words=5):
     """Split transcript segments into short, readable caption groups."""
     result = []
@@ -266,6 +292,7 @@ def split_caption_rows(rows, max_words=5):
                     current = []
             if current:
                 groups.append(current)
+            groups = _rebalance_short_caption_tail(groups)
             for group in groups:
                 group_start = float(group[0].get("start", row.get("start", 0)))
                 group_end = float(group[-1].get("end", row.get("end", group_start + 1)))
@@ -284,10 +311,13 @@ def split_caption_rows(rows, max_words=5):
             start_time = float(row.get("start", 0))
             end_time = max(start_time + 0.08, float(row.get("end", start_time + 1)))
             duration = end_time - start_time
-            for index in range(0, len(parts), max_words):
-                chunk = parts[index:index + max_words]
-                chunk_start = start_time + duration * index / len(parts)
-                chunk_end = start_time + duration * min(index + len(chunk), len(parts)) / len(parts)
+            groups = [parts[index:index + max_words] for index in range(0, len(parts), max_words)]
+            groups = _rebalance_short_caption_tail(groups)
+            cursor = 0
+            for chunk in groups:
+                chunk_start = start_time + duration * cursor / len(parts)
+                cursor += len(chunk)
+                chunk_end = start_time + duration * cursor / len(parts)
                 result.append({
                     "id": len(result) + 1,
                     "start": round(chunk_start, 3),
