@@ -211,7 +211,7 @@ def ai_proofread_rows(rows, output_language):
             "If unsure, return the original line unchanged. Return ONLY valid JSON as "
             "{\\"segments\\":[...]} with exactly the same number of strings as the input."
         )
-        user_prompt = "Output language: " + str(output_language) + "\\nTranscript lines (JSON): " + payload
+        user_prompt = "Output language: " + str(output_language) + "\nTranscript lines (JSON): " + payload
         response = model.create_chat_completion(
             messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
             temperature=0.0, top_p=0.2, max_tokens=512
