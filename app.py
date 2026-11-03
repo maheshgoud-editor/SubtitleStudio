@@ -248,7 +248,8 @@ def _rebalance_short_caption_tail(groups, min_words=3):
         else str(previous_last)
     ).strip()
     # Do not move words across an actual sentence-ending punctuation boundary.
-    if re.search(r'[.!?।]["”’)]*
+    trailing = previous_last_text.rstrip(chr(34) + "”’)]")
+    if trailing.endswith((".", "!", "?", "।")):
         return groups
     move = min(min_words - len(groups[-1]), len(previous) - min_words)
     if move > 0:
